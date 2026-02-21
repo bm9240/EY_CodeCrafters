@@ -1,7 +1,4 @@
 # --- Agent Frameworks ---
-langchain
-langchain-core
-langchain-community
 langgraph
 
 # --- LLM Providers ---

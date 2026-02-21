@@ -519,6 +519,85 @@ async def detect_intent_node(state: SalesAgentState) -> SalesAgentState:
     """
     logger.info(f"🤖 Detecting intent for: '{state['message'][:100]}...'")
     
+    # Check if we're awaiting clarification from previous interaction
+    metadata = state.get("metadata", {})
+    if metadata.get("awaiting_clarification"):
+        logger.info("📝 Processing clarifying question answers...")
+        
+        # Parse user's answers to clarifying questions
+        message = state["message"].lower().strip()
+        preferences = {}
+        
+        # Extract usage context
+        if any(word in message for word in ["running", "sports", "jogging", "marathon", "gym", "workout"]):
+            preferences["usage"] = "running_sports"
+        elif any(word in message for word in ["office", "work", "formal", "business", "corporate"]):
+            preferences["usage"] = "office_formal"
+        elif any(word in message for word in ["party", "celebration", "event", "special", "wedding"]):
+            preferences["usage"] = "party_special"
+        elif any(word in message for word in ["casual", "everyday", "daily", "home", "relaxed"]):
+            preferences["usage"] = "casual_everyday"
+        
+        # Extract budget
+        if "under" in message or "below" in message:
+            import re
+            budget_match = re.search(r'₹?(\d+)', message)
+            if budget_match:
+                preferences["budget_max"] = int(budget_match.group(1))
+        elif "2000" in message or "₹2000" in message:
+            preferences["budget_max"] = 2000
+        elif "5000" in message or "₹5000" in message:
+            preferences["budget_max"] = 5000
+        elif "10000" in message or "₹10000" in message:
+            preferences["budget_max"] = 10000
+        
+        # Extract colors
+        color_map = {
+            "black": "black", "white": "white", "blue": "blue", "red": "red",
+            "green": "green", "grey": "grey", "gray": "gray", "yellow": "yellow",
+            "purple": "purple", "pink": "pink", "orange": "orange", "brown": "brown"
+        }
+        for color_name, color_value in color_map.items():
+            if color_name in message:
+                preferences["color"] = color_value
+                break
+        
+        # Store preferences in session
+        if preferences:
+            from datetime import datetime
+            preferences["last_updated"] = datetime.now().isoformat()
+            
+            # Update session with preferences
+            session_token = state.get("session_token")
+            if session_token:
+                try:
+                    update_payload = {
+                        "action": "update_preferences",
+                        "preferences": preferences
+                    }
+                    update_response = requests.post(
+                        f"{os.getenv('SESSION_MANAGER_URL', 'http://localhost:8000')}/session/update",
+                        json=update_payload,
+                        headers={"X-Session-Token": session_token},
+                        timeout=5
+                    )
+                    if update_response.status_code == 200:
+                        logger.info(f"✅ Stored preferences: {preferences}")
+                    else:
+                        logger.warning(f"⚠️ Failed to store preferences: {update_response.status_code}")
+                except Exception as e:
+                    logger.error(f"❌ Error storing preferences: {e}")
+        
+        # Clear awaiting_clarification flag and route to recommendations
+        metadata["awaiting_clarification"] = False
+        state["intent"] = "recommendation"
+        state["confidence"] = 1.0
+        state["entities"] = preferences  # Use preferences as entities
+        state["intent_method"] = "clarification_response"
+        
+        logger.info(f"✅ Processed clarification response, routing to recommendations")
+        return state
+    
     # Special handling for __CHECKOUT__ command from web UI
     if state["message"].strip() == "__CHECKOUT__":
         logger.info("🛒 Detected __CHECKOUT__ command from web UI")
@@ -628,6 +707,7 @@ async def detect_intent_node(state: SalesAgentState) -> SalesAgentState:
 # ============================================================================
 
 def route_by_intent(state: SalesAgentState) -> Literal[
+    "clarifying_questions",
     "recommendation_worker",
     "inventory_worker",
     "payment_worker",
@@ -656,13 +736,13 @@ def route_by_intent(state: SalesAgentState) -> Literal[
     
     # Intent to worker mapping
     intent_mapping = {
-        "recommendation": "recommendation_worker",
-        "gifting": "recommendation_worker",  # Gifting uses recommendation service
+        "recommendation": "clarifying_questions",  # Route to clarifying questions first
+        "gifting": "clarifying_questions",  # Gifting uses recommendation service
         "inventory": "inventory_worker",
         "payment": "payment_worker",
         "loyalty": "loyalty_worker",  # Loyalty points and coupons
-        "comparison": "recommendation_worker",  # Comparison uses recommendation
-        "trend": "recommendation_worker",  # Trends use recommendation
+        "comparison": "clarifying_questions",  # Comparison uses recommendation
+        "trend": "recommendation_worker",  # Trends go directly to recommendation
         "ambient_commerce": "ambient_commerce_worker",
         # Route order tracking and support to fulfillment (not post-purchase)
         "support": "fulfillment_worker",
@@ -680,6 +760,101 @@ def route_by_intent(state: SalesAgentState) -> Literal[
 # ============================================================================
 # WORKER NODES: CALL MICROSERVICES
 # ============================================================================
+
+async def clarifying_questions_node(state: SalesAgentState) -> SalesAgentState:
+    """
+    Ask clarifying questions before showing recommendations.
+    
+    For recommendation intents, ask 1-2 engaging questions to gather:
+    - Usage context (running, casual, office, party)
+    - Budget range
+    - Preferred colors/styles
+    
+    Store answers in session preferences, then route to recommendation_worker.
+    """
+    logger.info("🤔 Checking if clarifying questions needed...")
+    
+    # Check if we already have preferences or if this is a follow-up
+    session_data = state.get("metadata", {}).get("session_state")
+    if session_data:
+        data = session_data.get("data", {})
+        preferences = data.get("preferences", {})
+        
+        # If we have recent preferences (from last 30 minutes), skip questions
+        last_updated = preferences.get("last_updated")
+        if last_updated:
+            from datetime import datetime
+            try:
+                last_time = datetime.fromisoformat(last_updated.replace('Z', '+00:00'))
+                if (datetime.now(last_time.tzinfo) - last_time).seconds < 1800:  # 30 minutes
+                    logger.info("✅ Recent preferences found, skipping clarifying questions")
+                    return await call_recommendation_worker(state)
+            except:
+                pass
+    
+    # Check conversation history for existing context
+    conversation_history = state.get("conversation_history", [])
+    entities = state.get("entities", {})
+    
+    # If entities already have good context, skip questions
+    has_usage = entities.get("usage") or entities.get("occasion") or entities.get("category")
+    has_budget = entities.get("price_max") or entities.get("price_min") or "budget" in str(state.get("message", "")).lower()
+    has_preferences = entities.get("color") or entities.get("style") or entities.get("brand")
+    
+    context_score = sum([bool(has_usage), bool(has_budget), bool(has_preferences)])
+    
+    if context_score >= 2:
+        logger.info(f"✅ Sufficient context found (score: {context_score}), proceeding to recommendations")
+        return await call_recommendation_worker(state)
+    
+    # Ask clarifying questions
+    logger.info("❓ Asking clarifying questions...")
+    
+    message = state.get("message", "").lower().strip()
+    
+    # Determine what questions to ask based on message content
+    questions = []
+    
+    # Question 1: Usage context
+    if not has_usage:
+        if "shoe" in message or "sneaker" in message or "boot" in message:
+            questions.append("What will you use these shoes for?\n• 🏃 Running/Sports\n• 👔 Office wear\n• 🎉 Party/Casual\n• 🏠 Everyday")
+        elif "shirt" in message or "top" in message:
+            questions.append("What style are you looking for?\n• 👔 Formal\n• 🎨 Casual\n• 🏃 Activewear\n• 🎉 Party wear")
+        else:
+            questions.append("What occasion is this for?\n• 🎉 Party/Special event\n• 👔 Work/Office\n• 🏃 Sports/Active\n• 🏠 Casual wear")
+    
+    # Question 2: Budget (if not mentioned)
+    if not has_budget and len(questions) < 2:
+        questions.append("What's your budget range?\n• 💰 Under ₹2000\n• 💎 ₹2000-₹5000\n• 👑 ₹5000-₹10000\n• 💎 Above ₹10000")
+    
+    # Question 3: Preferences (if space and no strong context)
+    if len(questions) < 2 and not has_preferences:
+        questions.append("Any color preferences?\n• ⚫ Black\n• ⚪ White\n• 🔵 Blue\n• 🔴 Red\n• 🌈 Other")
+    
+    # Limit to 2 questions max
+    questions = questions[:2]
+    
+    if questions:
+        # Combine questions into engaging response
+        response_parts = ["Sure! I'd love to help you find the perfect items. 🤗"]
+        response_parts.extend(questions)
+        response_parts.append("\nJust reply with your preferences and I'll show you great options!")
+        
+        state["response"] = "\n\n".join(response_parts)
+        state["cards"] = []
+        
+        # Mark that we're waiting for clarifying answers
+        if "metadata" not in state:
+            state["metadata"] = {}
+        state["metadata"]["awaiting_clarification"] = True
+        
+        logger.info(f"✅ Asked {len(questions)} clarifying questions")
+        return state
+    
+    # If no questions needed, proceed to recommendations
+    logger.info("✅ No clarifying questions needed, proceeding to recommendations")
+    return await call_recommendation_worker(state)
 
 async def call_recommendation_worker(state: SalesAgentState) -> SalesAgentState:
     """Call recommendation microservice."""
@@ -1486,6 +1661,7 @@ def create_sales_agent_graph() -> StateGraph:
     
     # Add nodes
     workflow.add_node("detect_intent", detect_intent_node)
+    workflow.add_node("clarifying_questions", clarifying_questions_node)
     workflow.add_node("recommendation_worker", call_recommendation_worker)
     workflow.add_node("inventory_worker", call_inventory_worker)
     workflow.add_node("payment_worker", call_payment_worker)
@@ -1503,6 +1679,7 @@ def create_sales_agent_graph() -> StateGraph:
         "detect_intent",
         route_by_intent,
         {
+            "clarifying_questions": "clarifying_questions",
             "recommendation_worker": "recommendation_worker",
             "inventory_worker": "inventory_worker",
             "payment_worker": "payment_worker",
@@ -1517,6 +1694,9 @@ def create_sales_agent_graph() -> StateGraph:
             "fallback_worker": "fallback_worker",
         }
     )
+    
+    # Add edge from clarifying questions to recommendation worker
+    workflow.add_edge("clarifying_questions", "recommendation_worker")
     
     # All workers end the flow
     workflow.add_edge("recommendation_worker", END)

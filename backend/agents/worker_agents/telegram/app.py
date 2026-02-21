@@ -1,6 +1,9 @@
 # Telegram Agent - FastAPI Server
 # Handles Telegram bot interactions and forwards to Sales Agent
-# Endpoints: POST /telegram/webhook (for Telegram webhooks)
+# Architecture: Telegram → Sales Agent → Worker Agents
+# 
+# Telegram ONLY forwards messages and displays responses.
+# All business logic is handled by Sales Agent.
 
 from fastapi import FastAPI, HTTPException, Request
 from fastapi.middleware.cors import CORSMiddleware
@@ -9,41 +12,31 @@ import uvicorn
 import requests
 import logging
 import os
-from typing import Optional, Dict, Any
+import sys
+from typing import Optional, Dict, Any, List
 import json
 from dotenv import load_dotenv
 from pathlib import Path
-import pandas as pd
-import os
 
 # Load environment variables from .env file
 load_dotenv(Path(__file__).parent.parent.parent.parent / ".env")
 
-# Absolute path to project root
-BASE_DIR = os.path.dirname(
-    os.path.dirname(
-        os.path.dirname(
-            os.path.dirname(os.path.abspath(__file__))
-        )
-    )
-)
+# Add backend to path for imports
+BACKEND_DIR = Path(__file__).parent.parent.parent.parent
+sys.path.insert(0, str(BACKEND_DIR))
 
-CUSTOMERS_CSV = os.path.join(BASE_DIR, "data", "customers.csv")
+# Import Supabase customer repository
+from db.repositories.customer_repo import get_customer_by_phone
 
 app = FastAPI(
     title="Telegram Agent",
-    description="Telegram bot integration for customer interactions",
-    version="1.0.0"
+    description="Telegram message forwarder - all logic handled by Sales Agent",
+    version="2.0.0"
 )
 
-# Pending messages storage (chat_id -> message)
-pending_messages = {}
-
-# Chat to customer mapping (chat_id -> customer_id)
-chat_customer_map = {}
-
-# Data API URL
-DATA_API_URL = os.getenv("DATA_API_URL", "http://localhost:8007")
+# In-memory storage for pending phone authentication
+# chat_id -> {"session_token": str, "customer_id": str, "phone": str, "awaiting_phone": bool}
+chat_state = {}
 
 # CORS configuration
 app.add_middleware(
@@ -73,7 +66,7 @@ TELEGRAM_API_URL = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}"
 class TelegramMessage(BaseModel):
     """Telegram message structure"""
     class Config:
-        extra = "ignore"  # Ignore extra fields
+        extra = "ignore"
 
     message_id: Optional[int] = None
     from_user: Optional[Dict[str, Any]] = Field(default=None, alias="from")
@@ -84,89 +77,49 @@ class TelegramMessage(BaseModel):
 class TelegramUpdate(BaseModel):
     """Telegram update structure"""
     class Config:
-        extra = "ignore"  # Ignore extra fields
+        extra = "ignore"
 
     update_id: Optional[int] = None
     message: Optional[TelegramMessage] = None
+    callback_query: Optional[Dict[str, Any]] = None
 
 # ==========================================
-# UTILITY FUNCTIONS
+# TELEGRAM API HELPERS
 # ==========================================
 
-async def get_customer_by_phone(phone: str) -> Optional[Dict[str, Any]]:
-    """Get customer data by phone number"""
-    logger.info(f"🔍 Looking up phone: {phone}")
+async def send_telegram_message(chat_id: int, text: str, reply_markup: Optional[Dict] = None) -> bool:
+    """Send a text message to Telegram chat"""
     try:
-        # Load customers from CSV using absolute path
-        logger.info(f"📁 Loading CSV from: {CUSTOMERS_CSV}")
-        customers_df = pd.read_csv(CUSTOMERS_CSV)
-        logger.info(f"📊 CSV loaded, shape: {customers_df.shape}")
+        # Validate inputs to prevent 400 errors
+        if not text or not isinstance(text, str):
+            logger.error(f"❌ Invalid text for chat {chat_id}: {text}")
+            return False
         
-        # Check if 'phone_number' column exists
-        if 'phone_number' not in customers_df.columns:
-            logger.error(f"❌ 'phone_number' column not found in CSV. Columns: {list(customers_df.columns)}")
-            return None
+        # Ensure text is not empty and is a string
+        text = str(text).strip()
+        if not text:
+            logger.error(f"❌ Empty text for chat {chat_id}")
+            return False
         
-        # Find customer by phone (convert both to string for comparison)
-        customer_row = customers_df[customers_df['phone_number'].astype(str) == phone]
-        logger.info(f"🔎 Found {len(customer_row)} matching rows for phone {phone}")
-        if not customer_row.empty:
-            customer = customer_row.iloc[0].to_dict()
-            logger.info(f"✅ Found customer: {customer.get('name')} (ID: {customer.get('customer_id')})")
-            return customer
-        logger.info(f"❌ No customer found for phone {phone}")
-        return None
-    except Exception as e:
-        logger.error(f"❌ Failed to get customer by phone: {e}")
-        return None
-
-async def create_session_with_phone(customer_id: str, phone: str) -> Optional[str]:
-    """Create or restore session using phone number"""
-    try:
-        # Try to restore existing session by customer_id
-        restore_url = f"{SESSION_MANAGER_URL}/session/restore"
-        headers = {"X-Customer-Id": str(customer_id)}
-
-        response = requests.get(restore_url, headers=headers, timeout=5)
-        if response.status_code == 200:
-            session_data = response.json()
-            logger.info(f"✅ Restored session for customer {customer_id}")
-            return session_data.get("session_token") or session_data.get("session", {}).get("session_token")
-
-        # Create new session
-        start_url = f"{SESSION_MANAGER_URL}/session/start"
-        payload = {
-            "phone": phone,
-            "channel": "telegram",
-            "customer_id": str(customer_id)
-        }
-
-        response = requests.post(start_url, json=payload, timeout=5)
-        response.raise_for_status()
-
-        session_data = response.json()
-        session_token = session_data.get("session_token")
-
-        logger.info(f"✅ Created new session for customer {customer_id}: {session_token}")
-        return session_token
-
-    except Exception as e:
-        logger.error(f"❌ Failed to create session for customer {customer_id}: {e}")
-        return None
-
-async def send_telegram_message(chat_id: str, text: str) -> bool:
-    """Send a message to Telegram chat"""
-    try:
         url = f"{TELEGRAM_API_URL}/sendMessage"
         payload = {
-            "chat_id": chat_id,
-            "text": text
-            # Removed parse_mode to avoid Markdown formatting errors
+            "chat_id": int(chat_id),  # Ensure int
+            "text": text,
+            "parse_mode": "Markdown"
         }
+        
+        if reply_markup:
+            payload["reply_markup"] = reply_markup
 
         response = requests.post(url, json=payload, timeout=10)
+        
+        # Log error details if failed
+        if response.status_code != 200:
+            error_data = response.json() if response.text else {}
+            logger.error(f"❌ Telegram API error {response.status_code}: {error_data}")
+            return False
+        
         response.raise_for_status()
-
         logger.info(f"✅ Sent message to Telegram chat {chat_id}")
         return True
 
@@ -174,48 +127,93 @@ async def send_telegram_message(chat_id: str, text: str) -> bool:
         logger.error(f"❌ Failed to send Telegram message: {e}")
         return False
 
-async def get_telegram_chat_info(chat_id: str) -> Optional[Dict[str, Any]]:
-    """Get chat information from Telegram"""
+async def send_telegram_photo(chat_id: int, photo_url: str, caption: Optional[str] = None) -> bool:
+    """Send a photo to Telegram chat"""
     try:
-        url = f"{TELEGRAM_API_URL}/getChat"
-        payload = {"chat_id": chat_id}
+        # Validate photo URL (must be HTTPS for Telegram)
+        if not photo_url or not isinstance(photo_url, str):
+            logger.error(f"❌ Invalid photo URL for chat {chat_id}: {photo_url}")
+            return False
+        
+        photo_url = str(photo_url).strip()
+        
+        # Ensure HTTPS for Telegram compatibility
+        if not photo_url.startswith(('https://', 'http://')):
+            logger.error(f"❌ Photo URL must be HTTP(S): {photo_url}")
+            return False
+        
+        url = f"{TELEGRAM_API_URL}/sendPhoto"
+        payload = {
+            "chat_id": int(chat_id),  # Ensure int
+            "photo": photo_url,
+            "parse_mode": "Markdown"
+        }
+        
+        if caption:
+            # Validate caption
+            caption = str(caption).strip()
+            if caption:
+                payload["caption"] = caption
 
         response = requests.post(url, json=payload, timeout=10)
+        
+        # Log error details if failed
+        if response.status_code != 200:
+            error_data = response.json() if response.text else {}
+            logger.error(f"❌ Telegram sendPhoto error {response.status_code}: {error_data}")
+            return False
+        
         response.raise_for_status()
-
-        return response.json().get("result")
+        logger.info(f"✅ Sent photo to Telegram chat {chat_id}")
+        return True
 
     except Exception as e:
-        logger.error(f"❌ Failed to get Telegram chat info: {e}")
-        return None
+        logger.error(f"❌ Failed to send Telegram photo: {e}")
+        return False
 
-# ==========================================
-# SESSION MANAGEMENT
-# ==========================================
-
-async def get_or_create_session_token(telegram_chat_id: str, phone_number: Optional[str] = None) -> Optional[str]:
-    """Get existing session token for Telegram chat or create new one"""
+async def send_inline_keyboard(chat_id: int, text: str, buttons: List[List[Dict]]) -> bool:
+    """Send a message with inline keyboard buttons"""
     try:
-        # First, try to find existing session by telegram_chat_id
-        restore_url = f"{SESSION_MANAGER_URL}/session/restore"
-        headers = {"X-Telegram-Chat-Id": telegram_chat_id}
+        reply_markup = {
+            "inline_keyboard": buttons
+        }
+        
+        return await send_telegram_message(chat_id, text, reply_markup)
 
-        response = requests.get(restore_url, headers=headers, timeout=5)
+    except Exception as e:
+        logger.error(f"❌ Failed to send inline keyboard: {e}")
+        return False
 
-        if response.status_code == 200:
-            session_data = response.json()
-            logger.info(f"✅ Restored session for Telegram chat {telegram_chat_id}: {session_data}")
-            return session_data.get("session", {}).get("session_token") or session_data.get("session_token")
+# ==========================================
+# CUSTOMER & SESSION MANAGEMENT
+# ==========================================
 
-        # If no existing session, create new one
+async def get_or_create_session(chat_id: int, customer_id: Optional[str] = None, phone: Optional[str] = None) -> Optional[str]:
+    """Get existing session or create new one for Telegram chat"""
+    try:
+        # Try to restore existing session by customer_id
+        if customer_id:
+            restore_url = f"{SESSION_MANAGER_URL}/session/restore"
+            headers = {"X-Customer-Id": str(customer_id)}
+            
+            response = requests.get(restore_url, headers=headers, timeout=5)
+            if response.status_code == 200:
+                session_data = response.json()
+                session_token = session_data.get("session_token") or session_data.get("session", {}).get("session_token")
+                logger.info(f"✅ Restored session for customer {customer_id}: {session_token}")
+                return session_token
+
+        # Create new session
         start_url = f"{SESSION_MANAGER_URL}/session/start"
         payload = {
             "channel": "telegram",
-            "telegram_chat_id": telegram_chat_id
+            "telegram_chat_id": str(chat_id)
         }
-
-        if phone_number:
-            payload["phone"] = phone_number
+        
+        if phone:
+            payload["phone"] = phone
+        if customer_id:
+            payload["customer_id"] = str(customer_id)
 
         response = requests.post(start_url, json=payload, timeout=5)
         response.raise_for_status()
@@ -223,146 +221,622 @@ async def get_or_create_session_token(telegram_chat_id: str, phone_number: Optio
         session_data = response.json()
         session_token = session_data.get("session_token")
 
-        logger.info(f"✅ Created new session for Telegram chat {telegram_chat_id}: {session_token}")
+        logger.info(f"✅ Created new session for Telegram chat {chat_id}: {session_token}")
         return session_token
 
     except Exception as e:
-        logger.error(f"❌ Failed to get/create session for Telegram chat {telegram_chat_id}: {e}")
+        logger.error(f"❌ Failed to get/create session: {e}")
         return None
 
+async def get_session_data(session_token: str) -> Optional[Dict[str, Any]]:
+    """Fetch full session data from Session Manager"""
+    try:
+        restore_url = f"{SESSION_MANAGER_URL}/session/restore"
+        headers = {"X-Session-Token": session_token}
+        
+        response = requests.get(restore_url, headers=headers, timeout=5)
+        if response.status_code == 200:
+            session_data = response.json()
+            return session_data.get("session")
+        
+        return None
+    except Exception as e:
+        logger.error(f"❌ Failed to fetch session data: {e}")
+        return None
+
+import httpx
+import os
+
+GROQ_API_KEY = os.getenv("GROQ_API_KEY")
+GROQ_MODEL = "llama-3.1-8b-instant"  # or your preferred model
+
+async def generate_ai_summary_with_groq(session_data: Dict[str, Any], customer_name: str) -> str:
+    """
+    Generate AI-powered persuasive summary using Groq
+    based on REAL session history + cart + loyalty data.
+    """
+
+    try:
+        data = session_data.get("data", {})
+        chat_history = data.get("chat_context", [])
+        cart = data.get("cart", [])
+        conversation_summary = data.get("conversation_summary", "")
+        loyalty_tier = data.get("loyalty_tier", "Member")
+        loyalty_points = data.get("loyalty_points", 0)
+
+        # Keep last 6 turns only (avoid token overflow)
+        recent_history = chat_history[-6:]
+
+        cart_summary = []
+        for item in cart:
+            cart_summary.append(
+                f"{item.get('name')} (₹{item.get('price')} x {item.get('quantity',1)})"
+            )
+
+        cart_text = ", ".join(cart_summary) if cart_summary else "No items in cart"
+
+        system_prompt = """
+You are a premium fashion sales assistant for a luxury brand.
+Your tone is warm, elegant, empathetic, and persuasive.
+Speak in SECOND PERSON.
+Be welcoming, stylish, and emotionally engaging.
+Keep it under 150 words.
+"""
+
+        user_prompt = f"""
+Customer Name: {customer_name}
+
+Conversation Summary: {conversation_summary}
+
+Recent Chat History:
+{recent_history}
+
+Cart Items:
+{cart_text}
+
+Loyalty Tier: {loyalty_tier}
+Loyalty Points: {loyalty_points}
+
+Create a personalized welcome-back summary.
+Mention:
+- What they were exploring
+- Cart reminder (if any)
+- Their loyalty tier
+- Encourage continuation
+- Ask a soft engaging question
+"""
+
+        async with httpx.AsyncClient(timeout=20) as client:
+            response = await client.post(
+                "https://api.groq.com/openai/v1/chat/completions",
+                headers={
+                    "Authorization": f"Bearer {GROQ_API_KEY}",
+                    "Content-Type": "application/json"
+                },
+                json={
+                    "model": GROQ_MODEL,
+                    "messages": [
+                        {"role": "system", "content": system_prompt},
+                        {"role": "user", "content": user_prompt}
+                    ],
+                    "temperature": 0.7
+                }
+            )
+
+            response.raise_for_status()
+            result = response.json()
+
+            summary_text = result["choices"][0]["message"]["content"].strip()
+
+            return summary_text
+
+    except Exception as e:
+        logger.error(f"❌ Groq summary generation failed: {e}")
+        return (
+            f"✨ Welcome back {customer_name}! 😊\n\n"
+            "I'm so glad you're here again.\n"
+            "What would you love to explore today?"
+        )
 # ==========================================
 # MESSAGE PROCESSING
 # ==========================================
 
 async def process_telegram_message(telegram_message: TelegramMessage) -> bool:
-    """Process incoming Telegram message and forward to Sales Agent"""
+    """
+    Process incoming Telegram message and forward to Sales Agent.
+    
+    Flow:
+        1. /start → Ask for phone (NO forward to Sales Agent)
+        2. Phone number → Validate from Supabase → Restore session → Show summary
+        3. User message → Forward to Sales Agent → Display structured response
+    """
     try:
-        logger.info(f"🔄 Processing Telegram message: {telegram_message.text[:50]}...")
-        
-        if not telegram_message.chat or not telegram_message.from_user or not telegram_message.text:
-            logger.info(f"⚠️  Ignoring incomplete message")
+        if not telegram_message.chat or not telegram_message.text:
             return True
 
-        chat_id = str(telegram_message.chat["id"])
+        # IMPORTANT: chat_id MUST be int for Telegram API
+        chat_id = int(telegram_message.chat["id"])
         text = telegram_message.text.strip()
 
         if not text:
-            logger.info(f"⚠️  Ignoring empty message from chat {chat_id}")
             return True
 
-        logger.info(f"📨 Telegram message from chat {chat_id}: '{text[:100]}...'")
+        logger.info(f"📨 Telegram message from chat {chat_id}: '{text[:50]}...'")
 
-        # Check if this chat already has a customer associated
-        existing_customer_id = chat_customer_map.get(chat_id)
-        if existing_customer_id:
-            logger.info(f"👤 Using existing customer {existing_customer_id} for chat {chat_id}")
-            # Restore session and process message directly
-            session_token = await create_session_with_phone(existing_customer_id, None)  # Phone not needed for restore
-            if not session_token:
-                await send_telegram_message(chat_id, "❌ Session expired. Please enter your phone number again.")
-                del chat_customer_map[chat_id]  # Remove invalid mapping
-                return True
-            
-            # Process the message directly with existing customer
-            customer_id = existing_customer_id
-        else:
-            # Check if this is a phone number
+        # ======================
+        # HANDLE /start COMMAND (DO NOT forward to Sales Agent)
+        # ======================
+        if text.lower() == "/start":
+            chat_state[str(chat_id)] = {"awaiting_phone": True}
+            await send_telegram_message(
+                chat_id,
+                "👋 Welcome to EY CodeCrafters Shopping!\n\n"
+                "📱 Please share your phone number to continue:"
+            )
+            return True
+
+        # ======================
+        # HANDLE PHONE NUMBER INPUT
+        # ======================
+        state = chat_state.get(str(chat_id), {})
+        
+        if state.get("awaiting_phone"):
+            # Validate phone number (10 digits)
             if text.isdigit() and len(text) == 10:
-                logger.info(f"📞 Detected phone number: {text}")
-                # Process as phone number
-                customer = await get_customer_by_phone(text)
-                logger.info(f"👤 Customer lookup result: {customer is not None}")
-                if customer:
-                    logger.info(f"👤 Found customer: {customer.get('name')} (ID: {customer.get('customer_id')})")
+                phone = text
+                
+                # Lookup customer from SUPABASE (not CSV)
+                logger.info(f"🔍 Looking up phone {phone} in Supabase...")
+                customer = get_customer_by_phone(phone)
+                
                 if not customer:
-                    logger.info(f"❌ Phone {text} not found in CSV")
-                    await send_telegram_message(chat_id, "❌ Phone number not found in our records. Please check and try again.")
+                    await send_telegram_message(
+                        chat_id,
+                        "❌ Phone number not found in our records.\n\n"
+                        "Please check and try again, or contact support."
+                    )
                     return True
 
-                customer_id = customer['customer_id']
-                session_token = await create_session_with_phone(customer_id, text)
+                customer_id = str(customer.get('customer_id'))
+                customer_name = customer.get('name', 'Customer')
+                
+                logger.info(f"✅ Found customer: {customer_name} (ID: {customer_id})")
+                
+                # Create or restore session from Redis
+                session_token = await get_or_create_session(chat_id, customer_id, phone)
                 
                 if not session_token:
-                    await send_telegram_message(chat_id, "❌ Failed to start session. Please try again.")
+                    await send_telegram_message(chat_id, "❌ Failed to start session. Please try /start again.")
                     return True
 
-                # Store the mapping for future messages
-                chat_customer_map[chat_id] = customer_id
+                # Fetch full session data to check if returning user
+                session_data = await get_session_data(session_token)
+                
+                # Store session info in state
+                chat_state[str(chat_id)] = {
+                    "session_token": session_token,
+                    "customer_id": customer_id,
+                    "phone": phone,
+                    "customer_name": customer_name,
+                    "awaiting_phone": False
+                }
 
-                # Check for pending message
-                pending_text = pending_messages.pop(chat_id, None)
-                if pending_text:
-                    # Process the pending message
-                    text = pending_text
-                    logger.info(f"📝 Processing pending message: {text}")
-                else:
-                    await send_telegram_message(chat_id, f"✅ Welcome {customer.get('name', 'Customer')}! How can I help you today?")
-                    return True
+                # Check if user has chat history (returning user)
+                if session_data:
+                    conversation_history = session_data.get("data", {}).get("chat_context", [])
+                    cart = session_data.get("data", {}).get("cart", [])
+                    
+                    # If returning user with history, show summary
+                    if len(conversation_history) > 0 or len(cart) > 0:
+                        logger.info(f"📚 Returning user detected: {len(conversation_history)} messages, {len(cart)} cart items")
+                        
+                        # Generate personalized summary
+                        summary = await generate_ai_summary_with_groq(session_data, customer_name)
+                        await send_telegram_message(chat_id, summary)
+                        
+                        logger.info(f"✅ Sent chat history summary to chat {chat_id}")
+                        return True
+
+                # New user or no history - send welcome message
+                await send_telegram_message(
+                    chat_id,
+                    f"✅ Welcome {customer_name}!\n\n"
+                    f"How can I help you today?\n\n"
+                    f"💡 Try asking:\n"
+                    f"• Show me running shoes\n"
+                    f"• I need a t-shirt under ₹1000\n"
+                    f"• What's in my cart?"
+                )
+                
+                logger.info(f"✅ Authenticated customer {customer_id} for chat {chat_id}")
+                return True
             else:
-                # Store as pending and ask for phone
-                pending_messages[chat_id] = text
-                await send_telegram_message(chat_id, "📱 Please enter your phone number to continue:")
+                await send_telegram_message(
+                    chat_id,
+                    "❌ Invalid phone number.\n\n"
+                    "Please enter a valid 10-digit phone number:"
+                )
                 return True
 
-        # At this point, we have session_token and text to process
-        # Continue with normal processing...
+        # ======================
+        # CHECK AUTHENTICATION
+        # ======================
+        if not state.get("session_token"):
+            await send_telegram_message(
+                chat_id,
+                "⚠️ Session not found.\n\n"
+                "Please use /start to begin."
+            )
+            return True
 
-        # Prepare metadata for Sales Agent
-        metadata = {
-            "channel": "telegram",
-            "telegram_chat_id": chat_id,
-            "customer_id": customer_id,
-            "phone": text if text.isdigit() and len(text) == 10 else None
-        }
+        session_token = state["session_token"]
+        customer_id = state["customer_id"]
 
-        # Forward to Sales Agent
+        # ======================
+        # FORWARD TO SALES AGENT
+        # ======================
+        logger.info(f"🔄 Forwarding to Sales Agent: {text[:50]}...")
+        
+        # Fetch current session state
+        session_data = await get_session_data(session_token)
+        
+        # Prepare request payload
         sales_payload = {
             "message": text,
             "session_token": session_token,
-            "metadata": metadata
+            "session_state": session_data,  # Include full session state
+            "metadata": {
+                "channel": "telegram",
+                "telegram_chat_id": str(chat_id),
+                "customer_id": customer_id,
+                "source": "telegram"
+            }
         }
 
-        logger.info(f"🔄 Forwarding to Sales Agent: {SALES_AGENT_URL}/api/message")
-        sales_response = requests.post(
-            f"{SALES_AGENT_URL}/api/message",
-            json=sales_payload,
-            timeout=30
-        )
+        # Call Sales Agent /api/message (ALL business logic happens here)
+        try:
+            sales_response = requests.post(
+                f"{SALES_AGENT_URL}/api/message",
+                json=sales_payload,
+                timeout=30
+            )
+            sales_response.raise_for_status()
+            sales_data = sales_response.json()
+            
+            logger.info(f"✅ Sales Agent response received")
 
-        sales_response.raise_for_status()
-        sales_data = sales_response.json()
-        logger.info(f"✅ Sales Agent response received")
+        except requests.exceptions.RequestException as e:
+            logger.error(f"❌ Failed to call Sales Agent: {e}")
+            await send_telegram_message(
+                chat_id,
+                "❌ Sorry, I'm experiencing technical difficulties.\n\n"
+                "Please try again in a moment."
+            )
+            return False
 
-        # Send agent reply back to Telegram
-        agent_reply = sales_data.get("reply", "Sorry, I couldn't process your request.")
-
-        # Handle product cards if present
-        cards = sales_data.get("cards", [])
-        if cards:
-            # Format cards for Telegram (plain text)
-            card_text = "\n\n".join([
-                f"📦 {card.get('name', 'Product')}\n"
-                f"💰 ₹{card.get('price', 'N/A')}\n"
-                f"📝 {card.get('personalized_reason', '')}"
-                for card in cards[:3]  # Limit to 3 cards
-            ])
-            agent_reply += f"\n\n{card_text}"
-
-        success = await send_telegram_message(chat_id, agent_reply)
-
-        if success:
-            logger.info(f"✅ Processed Telegram message from chat {chat_id}")
+        # ======================
+        # DISPLAY STRUCTURED RESPONSE
+        # ======================
+        
+        logger.info(f"📦 Sales Agent response keys: {list(sales_data.keys())}")
+        
+        # 1. Extract and send chat message (ALWAYS a string, never raw JSON)
+        chat_message = sales_data.get("reply", "")
+        
+        # Log the raw response for debugging
+        logger.info(f"💬 Raw chat_message: '{chat_message[:100]}...'")
+        
+        # Ensure it's a string
+        if chat_message and isinstance(chat_message, str):
+            chat_message = chat_message.strip()
+            if chat_message:
+                logger.info(f"✅ Sending chat message to Telegram")
+                await send_telegram_message(chat_id, chat_message)
+            else:
+                logger.warning(f"⚠️ Empty chat message after stripping")
         else:
-            logger.error(f"❌ Failed to send reply to Telegram chat {chat_id}")
+            logger.error(f"❌ Invalid chat message type: {type(chat_message)}")
 
-        return success
+        # 2. Send product images (if any) - AFTER text message
+        cards = sales_data.get("cards", [])
+        if cards and isinstance(cards, list) and len(cards) > 0:
+            logger.info(f"📦 Sending {len(cards)} product cards...")
+            
+            for card in cards[:5]:  # Limit to 5 images
+                product_name = card.get("name", "Product")
+                product_price = card.get("price", "N/A")
+                image_url = card.get("image")
+                sku = card.get("sku", card.get("id"))
+                
+                if image_url:
+                    # Validate HTTPS before sending
+                    if image_url.startswith(('https://', 'http://')):
+                        caption = f"*{product_name}*\n💰 ₹{product_price}"
+                        logger.info(f"🖼️ Sending product image: {image_url[:50]}...")
+                        await send_telegram_photo(chat_id, image_url, caption)
+                    else:
+                        logger.warning(f"⚠️ Skipping invalid image URL: {image_url}")
+        else:
+            logger.info(f"📦 No product cards to send")
+
+        # 3. Handle payment link or checkout buttons
+        metadata = sales_data.get("metadata", {})
+        payment_link = metadata.get("payment_link")
+        
+        if payment_link:
+            logger.info(f"💳 Sending payment link button...")
+            
+            # Create inline keyboard with payment button
+            buttons = [[{
+                "text": "💳 Complete Payment",
+                "url": payment_link
+            }]]
+            
+            await send_inline_keyboard(
+                chat_id,
+                "Click the button below to complete your payment:",
+                buttons
+            )
+        
+        # 4. Add quick action buttons for products
+        elif cards and len(cards) > 0:
+            logger.info(f"🔘 Adding action buttons for {len(cards)} products...")
+            # Add "Buy Now" and "Add to Cart" buttons
+            buttons = []
+            for idx, card in enumerate(cards[:3]):  # Max 3 buttons
+                sku = card.get("sku", card.get("id"))
+                if sku:
+                    buttons.append([
+                        {
+                            "text": f"🛒 Add {card.get('name', 'Product')} to Cart",
+                            "callback_data": f"ADD_TO_CART|{sku}|1"
+                        },
+                        {
+                            "text": f"⚡ Buy {card.get('name', 'Product')} Now",
+                            "callback_data": f"BUY_NOW|{sku}|1"
+                        }
+                    ])
+            
+            # Add checkout button if cart exists
+            session_data = await get_session_data(session_token)
+            cart = session_data.get("data", {}).get("cart", []) if session_data else []
+            if cart:
+                buttons.append([{
+                    "text": "🛍️ Checkout",
+                    "callback_data": "CHECKOUT"
+                }])
+            
+            if buttons:
+                await send_inline_keyboard(
+                    chat_id,
+                    "Quick actions:",
+                    buttons
+                )
+
+        logger.info(f"✅ Processed Telegram message from chat {chat_id}")
+        return True
 
     except Exception as e:
-        logger.error(f"❌ Failed to process Telegram message: {e}")
+        logger.error(f"❌ Failed to process Telegram message: {e}", exc_info=True)
         try:
-            await send_telegram_message(chat_id, "Sorry, I'm having trouble processing your message. Please try again.")
+            await send_telegram_message(
+                int(telegram_message.chat["id"]),
+                "Sorry, I'm having trouble processing your message. Please try again."
+            )
         except:
             pass
+        return False
+
+# ==========================================
+# CALLBACK QUERY PROCESSING
+# ==========================================
+
+async def process_callback_query(callback_query: Dict[str, Any]) -> bool:
+    """
+    Process inline button callback queries.
+    
+    Supported actions:
+    - ADD_TO_CART|SKU|QTY
+    - BUY_NOW|SKU|QTY  
+    - CHECKOUT
+    """
+    try:
+        query_id = callback_query.get("id")
+        data = callback_query.get("data", "")
+        from_user = callback_query.get("from", {})
+        chat_id = from_user.get("id")
+        
+        if not chat_id or not data:
+            logger.error(f"❌ Invalid callback query: {callback_query}")
+            return False
+        
+        chat_id = int(chat_id)
+        logger.info(f"🔘 Callback query from chat {chat_id}: {data}")
+        
+        # Parse callback data
+        parts = data.split("|")
+        action = parts[0] if len(parts) > 0 else ""
+        
+        # Get user session
+        state = chat_state.get(str(chat_id), {})
+        if not state.get("session_token"):
+            await answer_callback_query(query_id, "Session expired. Please use /start again.")
+            return False
+        
+        session_token = state["session_token"]
+        customer_id = state["customer_id"]
+        
+        # Handle different actions
+        if action == "ADD_TO_CART":
+            if len(parts) < 3:
+                await answer_callback_query(query_id, "Invalid cart data")
+                return False
+            
+            sku = parts[1]
+            qty = int(parts[2]) if len(parts) > 2 else 1
+            
+            # Update cart directly via Session Manager (don't call Sales Agent)
+            try:
+                cart_payload = {
+                    "action": "add_to_cart",
+                    "sku": sku,
+                    "quantity": qty
+                }
+                
+                cart_response = requests.post(
+                    f"{SESSION_MANAGER_URL}/session/update",
+                    json=cart_payload,
+                    headers={"X-Session-Token": session_token},
+                    timeout=10
+                )
+                cart_response.raise_for_status()
+                
+                await answer_callback_query(query_id, f"🛒 Added to cart successfully!")
+                await send_telegram_message(chat_id, f"🛒 *{sku}* added to your cart!")
+                
+                logger.info(f"✅ Added {sku} to cart for customer {customer_id}")
+                return True
+                
+            except Exception as e:
+                logger.error(f"❌ Failed to add to cart: {e}")
+                await answer_callback_query(query_id, "Failed to add to cart")
+                return False
+        
+        elif action == "BUY_NOW":
+            if len(parts) < 3:
+                await answer_callback_query(query_id, "Invalid buy data")
+                return False
+            
+            sku = parts[1]
+            qty = int(parts[2]) if len(parts) > 2 else 1
+            
+            # Add to cart first, then trigger checkout
+            try:
+                cart_payload = {
+                    "action": "add_to_cart",
+                    "sku": sku,
+                    "quantity": qty
+                }
+                
+                cart_response = requests.post(
+                    f"{SESSION_MANAGER_URL}/session/update",
+                    json=cart_payload,
+                    headers={"X-Session-Token": session_token},
+                    timeout=10
+                )
+                cart_response.raise_for_status()
+                
+                # Now trigger checkout
+                checkout_payload = {
+                    "message": "__CHECKOUT__",
+                    "session_token": session_token,
+                    "metadata": {
+                        "channel": "telegram",
+                        "telegram_chat_id": str(chat_id),
+                        "customer_id": customer_id,
+                        "source": "telegram_checkout"
+                    }
+                }
+                
+                await answer_callback_query(query_id, "Processing payment...")
+                
+                # Call Sales Agent for checkout
+                sales_response = requests.post(
+                    f"{SALES_AGENT_URL}/api/message",
+                    json=checkout_payload,
+                    timeout=30
+                )
+                sales_response.raise_for_status()
+                sales_data = sales_response.json()
+                
+                # Extract and send response
+                chat_message = sales_data.get("reply", "")
+                if chat_message and isinstance(chat_message, str):
+                    chat_message = chat_message.strip()
+                    if chat_message:
+                        await send_telegram_message(chat_id, chat_message)
+                
+                logger.info(f"✅ Buy now completed for {sku}")
+                return True
+                
+            except Exception as e:
+                logger.error(f"❌ Failed to buy now: {e}")
+                await answer_callback_query(query_id, "Failed to process purchase")
+                return False
+        
+        elif action == "CHECKOUT":
+            # Trigger checkout process
+            try:
+                checkout_payload = {
+                    "message": "__CHECKOUT__",
+                    "session_token": session_token,
+                    "metadata": {
+                        "channel": "telegram",
+                        "telegram_chat_id": str(chat_id),
+                        "customer_id": customer_id,
+                        "source": "telegram_checkout"
+                    }
+                }
+                
+                await answer_callback_query(query_id, "Processing payment...")
+                
+                # Call Sales Agent for checkout
+                sales_response = requests.post(
+                    f"{SALES_AGENT_URL}/api/message",
+                    json=checkout_payload,
+                    timeout=30
+                )
+                sales_response.raise_for_status()
+                sales_data = sales_response.json()
+                
+                # Extract and send response
+                chat_message = sales_data.get("reply", "")
+                if chat_message and isinstance(chat_message, str):
+                    chat_message = chat_message.strip()
+                    if chat_message:
+                        await send_telegram_message(chat_id, chat_message)
+                
+                # Clear cart if success (check for success indicators)
+                if "success" in chat_message.lower() or "completed" in chat_message.lower():
+                    # Optionally clear cart - but Sales Agent should handle this
+                    pass
+                
+                logger.info(f"✅ Checkout processed")
+                return True
+                
+            except Exception as e:
+                logger.error(f"❌ Failed to checkout: {e}")
+                await answer_callback_query(query_id, "Failed to process checkout")
+                return False
+        
+        else:
+            await answer_callback_query(query_id, "Unknown action")
+            return False
+            
+    except Exception as e:
+        logger.error(f"❌ Failed to process callback query: {e}", exc_info=True)
+        try:
+            await answer_callback_query(callback_query.get("id"), "Error processing request")
+        except:
+            pass
+        return False
+
+async def answer_callback_query(query_id: str, text: str = "", show_alert: bool = False) -> bool:
+    """Answer a callback query to remove loading state"""
+    try:
+        url = f"{TELEGRAM_API_URL}/answerCallbackQuery"
+        payload = {
+            "callback_query_id": query_id,
+            "text": text,
+            "show_alert": show_alert
+        }
+        
+        response = requests.post(url, json=payload, timeout=10)
+        response.raise_for_status()
+        return True
+        
+    except Exception as e:
+        logger.error(f"❌ Failed to answer callback query: {e}")
         return False
 
 # ==========================================
@@ -375,44 +849,37 @@ async def root():
     return {
         "service": "Telegram Agent",
         "status": "running",
-        "version": "1.0.0",
+        "version": "2.0.0",
+        "architecture": "Telegram → Sales Agent → Worker Agents",
         "telegram_configured": bool(TELEGRAM_BOT_TOKEN)
     }
 
 @app.post("/telegram/webhook")
 async def telegram_webhook(update: TelegramUpdate):
-    """Handle incoming Telegram updates via webhook"""
+    """
+    Handle incoming Telegram updates via webhook.
+    
+    This is the main entry point for all Telegram messages.
+    All business logic is delegated to Sales Agent.
+    """
     try:
-        if not update.message:
-            # Ignore non-message updates (edits, etc.)
+        if update.message:
+            # Process regular message
+            success = await process_telegram_message(update.message)
+            return {"status": "processed" if success else "failed"}
+        
+        elif update.callback_query:
+            # Process callback query (button clicks)
+            success = await process_callback_query(update.callback_query)
+            return {"status": "callback_processed" if success else "callback_failed"}
+        
+        else:
+            # Ignore other update types
             return {"status": "ignored"}
-
-        # Process the message
-        success = await process_telegram_message(update.message)
-
-        return {"status": "processed" if success else "failed"}
 
     except Exception as e:
         logger.error(f"❌ Webhook error: {e}")
         raise HTTPException(status_code=500, detail=str(e))
-
-@app.post("/telegram/send-message")
-async def send_message(chat_id: str, message: str):
-    """Manually send a message to a Telegram chat (for testing)"""
-    success = await send_telegram_message(chat_id, message)
-    return {"success": success}
-
-@app.get("/telegram/chat/{chat_id}")
-async def get_chat_info(chat_id: str):
-    """Get Telegram chat information"""
-    chat_info = await get_telegram_chat_info(chat_id)
-    if not chat_info:
-        raise HTTPException(status_code=404, detail="Chat not found")
-    return chat_info
-
-# ==========================================
-# BOT SETUP
-# ==========================================
 
 @app.post("/telegram/set-webhook")
 async def set_webhook(webhook_url: str):
@@ -424,20 +891,21 @@ async def set_webhook(webhook_url: str):
         url = f"{TELEGRAM_API_URL}/setWebhook"
         payload = {
             "url": webhook_url,
-            "allowed_updates": ["message"]
+            "allowed_updates": ["message", "callback_query"]
         }
 
         response = requests.post(url, json=payload, timeout=10)
         response.raise_for_status()
 
         result = response.json()
+        logger.info(f"✅ Webhook set to: {webhook_url}")
         return result
 
     except Exception as e:
         logger.error(f"❌ Failed to set webhook: {e}")
         raise HTTPException(status_code=500, detail=str(e))
 
-@app.get("/telegram/get-webhook")
+@app.get("/telegram/webhook-info")
 async def get_webhook_info():
     """Get current webhook information"""
     try:
@@ -455,5 +923,14 @@ async def get_webhook_info():
         logger.error(f"❌ Failed to get webhook info: {e}")
         raise HTTPException(status_code=500, detail=str(e))
 
+# ==========================================
+# STARTUP
+# ==========================================
+
 if __name__ == "__main__":
+    logger.info("🚀 Starting Telegram Agent...")
+    logger.info(f"📡 Sales Agent URL: {SALES_AGENT_URL}")
+    logger.info(f"🔐 Session Manager URL: {SESSION_MANAGER_URL}")
+    logger.info(f"🤖 Telegram Bot Configured: {bool(TELEGRAM_BOT_TOKEN)}")
+    
     uvicorn.run(app, host="0.0.0.0", port=8011)
