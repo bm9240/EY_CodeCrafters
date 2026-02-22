@@ -168,3 +168,23 @@ def calculate_cashback(amount: float, payment_method: str) -> float:
     
     rate = cashback_rates.get(payment_method.lower(), 0.0)
     return round(amount * rate, 2)
+
+
+def get_stock_key(sku: str, location: str) -> str:
+    """Generate Redis key for inventory stock.
+    
+    Args:
+        sku: Product SKU
+        location: Store location/identifier (e.g., 'STORE_MUMBAI' or 'online')
+        
+    Returns:
+        Redis key for inventory lookup
+    """
+    # Normalize location
+    if location.startswith("store:"):
+        location = location.split(":", 1)[1]
+    
+    location = location.replace("-", "_").upper()
+    sku = sku.upper()
+    
+    return f"inventory:stock:{sku}:{location}"

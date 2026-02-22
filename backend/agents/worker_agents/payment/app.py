@@ -551,12 +551,16 @@ def _normalize_order_items(items: List[Dict[str, Any]], default_store: Optional[
         sku_value = raw.get("sku") or raw.get("product_id")
         sku = str(sku_value).strip() if sku_value is not None else None
 
+        # Convert prices to integers (keep in rupees, just remove decimals for Supabase bigint)
+        unit_price_int = int(round(unit_price))
+        line_total_int = int(round(line_total))
+
         normalized_item.update({
             "sku": sku,
             "qty": qty_value,
             "quantity": qty_value,
-            "unit_price": round(unit_price, 2),
-            "line_total": round(line_total, 2),
+            "unit_price": unit_price_int,
+            "line_total": line_total_int,
             "store_id": store_id,
             "location": location,
         })
@@ -809,13 +813,84 @@ def _update_inventory(normalized_items: List[Dict[str, Any]], default_store: Opt
                 logger.warning(f"⚠️  Failed to update Redis inventory for {sku}/{store_id}: {exc}")
 
 
-def _notify_session_manager_of_payment(metadata: Dict[str, Any], user_id: Optional[str], payment_id: str, order_id: str) -> None:
+def _generate_tracking_id() -> str:
+    """Generate a unique tracking ID for the order."""
+    return f"TRK-{uuid.uuid4().hex[:12].upper()}"
+
+
+def _format_payment_success_message(items: Optional[List[Dict[str, Any]]], amount: float) -> str:
+    """Format a detailed payment success message with items list.
+    
+    Args:
+        items: List of items in the order
+        amount: Total amount paid
+        
+    Returns:
+        Formatted message string
+    """
+    if not items:
+        return f"✅ Payment successful! Order amount: ₹{amount:.2f}"
+    
+    # Build items summary
+    items_list = []
+    for item in items:
+        if isinstance(item, dict):
+            product_name = item.get("name") or item.get("product_name") or item.get("title") or "Item"
+            qty = item.get("quantity", item.get("qty", 1))
+            size = item.get("size") or ""
+            color = item.get("color") or ""
+            
+            size_color = []
+            if size:
+                size_color.append(f"Size: {size}")
+            if color:
+                size_color.append(f"Color: {color}")
+            
+            variant_info = f" ({', '.join(size_color)})" if size_color else ""
+            items_list.append(f"• {product_name} x{qty}{variant_info}")
+    
+    items_text = "\n".join(items_list) if items_list else "Items: Processing..."
+    message = f"""✅ **Payment Successful!**
+
+Your payment of ₹{amount:.2f} has been confirmed.
+
+**Order Items:**
+{items_text}
+
+Your order is being processed and will be dispatched shortly!"""
+    
+    return message
+
+
+def _notify_session_manager_of_payment(
+    metadata: Dict[str, Any], 
+    user_id: Optional[str], 
+    payment_id: str, 
+    order_id: str,
+    items: Optional[List[Dict[str, Any]]] = None,
+    amount: float = 0.0
+) -> Tuple[Optional[str], str]:
     """Attempt to notify the Session Manager to append a chat message about a successful payment.
 
     This is best-effort and will not raise on error.
+    
+    Args:
+        metadata: Payment metadata
+        user_id: User/customer ID
+        payment_id: Payment transaction ID
+        order_id: Order ID
+        items: List of items in the order
+        amount: Total amount paid
+        
+    Returns:
+        Tuple of (tracking_id, message) - tracking_id is None if generation failed
     """
+    tracking_id = None
     try:
         session_mgr = os.getenv("SESSION_MANAGER_URL", "http://localhost:8000").rstrip('/')
+
+        # Generate tracking ID
+        tracking_id = _generate_tracking_id()
 
         # Prefer an explicit session token if provided in metadata
         session_token = None
@@ -829,7 +904,9 @@ def _notify_session_manager_of_payment(metadata: Dict[str, Any], user_id: Option
         if not phone and user_id:
             phone = str(user_id)
 
-        message = f"Payment successful — payment_id={payment_id}, order_id={order_id}"
+        # Format detailed message with items
+        detailed_message = _format_payment_success_message(items, amount)
+        simple_message = f"✅ Payment successful for order {order_id}"
 
         # If we don't have a session token, try to recover one from the session/restore endpoint using phone
         if not session_token and phone:
@@ -849,8 +926,14 @@ def _notify_session_manager_of_payment(metadata: Dict[str, Any], user_id: Option
                     "action": "chat_message",
                     "payload": {
                         "sender": "agent",
-                        "message": message,
-                        "metadata": {"payment_id": payment_id, "order_id": order_id}
+                        "message": detailed_message,
+                        "metadata": {
+                            "payment_id": payment_id, 
+                            "order_id": order_id,
+                            "tracking_id": tracking_id,
+                            "amount": amount,
+                            "items_count": len(items) if items else 0
+                        }
                     }
                 }
                 headers = {"X-Session-Token": session_token, "Content-Type": "application/json"}
@@ -858,13 +941,15 @@ def _notify_session_manager_of_payment(metadata: Dict[str, Any], user_id: Option
                 if resp.status_code != 200:
                     logger.warning(f"[payment] Session update returned {resp.status_code}: {resp.text}")
                 else:
-                    logger.info(f"[payment] Notified session manager for payment {payment_id}")
+                    logger.info(f"[payment] Notified session manager for payment {payment_id} with tracking {tracking_id}")
             except Exception as e:
                 logger.warning(f"[payment] Failed to notify session manager: {e}")
         else:
             logger.debug("No session token or phone available; skipping session notify")
     except Exception as e:
         logger.warning(f"[payment] Unexpected error notifying session manager: {e}")
+    
+    return tracking_id, f"✅ Payment successful"
 
 
 # ==========================================
@@ -1236,7 +1321,14 @@ async def verify_razorpay_payment(payload: RazorpayVerifyRequest):
     user_key = payload.user_id or payment_id
     _store_transaction_safely(payment_id, transaction_payload, user_key, amount_rupees)
     try:
-        _notify_session_manager_of_payment(metadata, payload.user_id or customer_id, payment_id, canonical_order_id)
+        _notify_session_manager_of_payment(
+            metadata, 
+            payload.user_id or customer_id, 
+            payment_id, 
+            canonical_order_id,
+            items=normalized_items,
+            amount=float(amount_rupees)
+        )
     except Exception:
         logger.debug("Notification to session manager failed (non-fatal)")
 
@@ -1439,7 +1531,14 @@ async def process_payment(request: PaymentRequest):
             }
 
             try:
-                _notify_session_manager_of_payment(metadata_dict, request.user_id or customer_id, payment_id, canonical_order_id)
+                _notify_session_manager_of_payment(
+                    metadata_dict, 
+                    request.user_id or customer_id, 
+                    payment_id, 
+                    canonical_order_id,
+                    items=normalized_items,
+                    amount=request.amount
+                )
             except Exception:
                 logger.debug("Notification to session manager failed (non-fatal)")
 
