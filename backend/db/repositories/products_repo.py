@@ -13,6 +13,8 @@ COLUMN_MAPPING = {
     "product_display_name": "ProductDisplayName",
     "sub_category": "subcategory",
     "review_count": "review_count",  # Keep as is - code expects review_count
+    "rating": "ratings",             # Supabase uses singular; code expects plural
+    "master_category": "category",   # Supabase uses master_category; CSV uses category
     # Note: 'category' and other fields exist as-is in new CSV schema, no mapping needed
 }
 
@@ -28,20 +30,29 @@ def _normalize_columns(df: pd.DataFrame) -> pd.DataFrame:
 def get_all_products() -> Optional[pd.DataFrame]:
     """
     Get all products from Supabase as a DataFrame.
-    
-    Returns:
-        DataFrame with all products, or None on error/disabled
+    Paginates with limit/offset to fetch beyond the default 1000-row PostgREST cap.
     """
     if not is_enabled():
         return None
-    
+
     try:
-        rows = select("products")
-        if not rows:
+        all_rows = []
+        page_size = 1000
+        offset = 0
+        while True:
+            rows = select("products", params=f"limit={page_size}&offset={offset}")
+            if not rows:
+                break
+            all_rows.extend(rows)
+            if len(rows) < page_size:
+                break  # last page
+            offset += page_size
+
+        if not all_rows:
             print("[products_repo] No products found in Supabase")
             return None
-        
-        df = pd.DataFrame(rows)
+
+        df = pd.DataFrame(all_rows)
         df = _normalize_columns(df)
         print(f"[products_repo] Loaded {len(df)} products from Supabase")
         return df

@@ -601,6 +601,16 @@ async def handle_message(request: MessageRequest):
                 enhanced_metadata["session_id"] = sess.get("session_id")
                 enhanced_metadata["customer_id"] = sess.get("customer_id")
                 enhanced_metadata["session_metadata"] = session_metadata
+
+                # Restore recommendation clarification context from last agent message
+                for msg in reversed(conversation_history):
+                    if msg.get("sender") == "agent":
+                        msg_meta = msg.get("metadata") or {}
+                        if "recommendation_context" in msg_meta:
+                            enhanced_metadata["recommendation_context"] = msg_meta["recommendation_context"]
+                            enhanced_metadata["awaiting_recommendation_clarification"] = msg_meta.get("awaiting_recommendation_clarification", False)
+                            logger.info(f"🔄 Restored recommendation_context (mode={msg_meta['recommendation_context'].get('mode')}, awaiting={msg_meta.get('awaiting_recommendation_clarification')})")
+                        break
                 
                 logger.info(f"📚 Retrieved {len(conversation_history)} conversation turns")
                 logger.info(f"📞 Session phone: {sess.get('phone')}")
@@ -772,7 +782,9 @@ Generate ONLY the welcome message (no extra text):"""
                     "intent": result["intent"],
                     "confidence": result["confidence"],
                     "method": result["method"],
-                    "cards": result.get("cards", [])  # Include cards for SKU tracking
+                    "cards": result.get("cards", []),  # Include cards for SKU tracking
+                    "recommendation_context": result.get("recommendation_context"),
+                    "awaiting_recommendation_clarification": result.get("awaiting_recommendation_clarification", False),
                 }
                 
                 requests.post(
