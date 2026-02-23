@@ -4,11 +4,29 @@ import { User, Phone, MapPin, Award, TrendingUp, Calendar } from 'lucide-react';
 import Navbar from '@/components/Navbar.jsx';
 import QRAuth from '@/components/QRAuth.jsx';
 import sessionStore from '@/lib/session';
+import { getTierInfo } from '../../services/loyaltyService';
 
 const ProfilePage = () => {
   const navigate = useNavigate();
   const [profile, setProfile] = useState(null);
   const [phone, setPhone] = useState('');
+  const [realLoyaltyData, setRealLoyaltyData] = useState(null);
+  const [loyaltyLoading, setLoyaltyLoading] = useState(false);
+
+  const fetchRealLoyaltyData = async (customerId) => {
+    if (!customerId) return;
+    
+    setLoyaltyLoading(true);
+    try {
+      const loyaltyInfo = await getTierInfo(customerId);
+      setRealLoyaltyData(loyaltyInfo);
+    } catch (error) {
+      console.error('Failed to fetch real loyalty data:', error);
+      // Keep the existing profile data as fallback
+    } finally {
+      setLoyaltyLoading(false);
+    }
+  };
 
   useEffect(() => {
     // Load profile from session store
@@ -23,6 +41,12 @@ const ProfilePage = () => {
 
     setProfile(storedProfile);
     setPhone(storedPhone);
+    
+    // Fetch real loyalty data
+    const customerId = storedProfile.customer_id || storedProfile.customerId;
+    if (customerId) {
+      fetchRealLoyaltyData(customerId);
+    }
   }, [navigate]);
 
   if (!profile) {
@@ -62,8 +86,8 @@ const ProfilePage = () => {
   } = profile;
 
   const displayCustomerId = customer_id || customerId || '--';
-  const displayLoyaltyTier = loyalty_tier || loyaltyTier || 'Bronze';
-  const displayLoyaltyPoints = loyalty_points || loyaltyPoints || 0;
+  const displayLoyaltyTier = realLoyaltyData?.tier || profile?.loyalty_tier || profile?.loyaltyTier || 'Bronze';
+  const displayLoyaltyPoints = realLoyaltyData?.points ?? profile?.loyalty_points ?? profile?.loyaltyPoints ?? 0;
   const displayTotalSpend = total_spend || totalSpend || 0;
   const displayItemsPurchased = items_purchased || itemsPurchased || 0;
   const displayAverageRating = average_rating || averageRating || 0;
@@ -191,20 +215,35 @@ const ProfilePage = () => {
                 <Award className="w-8 h-8" />
                 <div>
                   <h3 className="text-lg font-semibold">Loyalty Status</h3>
-                  <p className="text-sm text-orange-100">Rewards & Benefits</p>
+                  <p className="text-sm text-orange-100">
+                    {loyaltyLoading ? 'Updating...' : 'Real-time Rewards & Benefits'}
+                  </p>
                 </div>
               </div>
               
               <div className="space-y-4">
                 <div className="bg-white/10 backdrop-blur rounded-lg p-4">
                   <p className="text-sm text-orange-100 mb-1">Current Tier</p>
-                  <p className="text-2xl font-bold">{displayLoyaltyTier}</p>
+                  <p className="text-2xl font-bold">
+                    {loyaltyLoading ? '...' : displayLoyaltyTier}
+                  </p>
                 </div>
                 
                 <div className="bg-white/10 backdrop-blur rounded-lg p-4">
                   <p className="text-sm text-orange-100 mb-1">Loyalty Points</p>
-                  <p className="text-2xl font-bold">{displayLoyaltyPoints}</p>
+                  <p className="text-2xl font-bold">
+                    {loyaltyLoading ? '...' : displayLoyaltyPoints.toLocaleString()}
+                  </p>
                 </div>
+                
+                {realLoyaltyData && realLoyaltyData.next_tier && (
+                  <div className="bg-white/10 backdrop-blur rounded-lg p-4">
+                    <p className="text-sm text-orange-100 mb-1">Next Tier: {realLoyaltyData.next_tier}</p>
+                    <p className="text-sm text-orange-200">
+                      {realLoyaltyData.points_to_next_tier?.toLocaleString() || 0} points to go
+                    </p>
+                  </div>
+                )}
               </div>
 
               <button

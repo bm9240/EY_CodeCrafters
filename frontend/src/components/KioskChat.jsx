@@ -266,35 +266,34 @@ const KioskChat = () => {
             setSessionInfo(restoredSession);
             sessionStore.setPhone(phone);
 
-            // Fetch customer context for Kiosk channel
-            if (restoredSession?.channel === 'kiosk' && restoredSession?.data?.conversation_summary) {
+            // Fetch AI-powered customer summary for Kiosk channel (third person POV)
+            if (restoredSession?.data?.chat_context?.length > 0 || restoredSession?.data?.cart?.length > 0) {
               try {
-                console.log('[KioskChat] 🖥️ Fetching customer context for Kiosk...');
-                const contextResp = await fetch(`${SALES_API}/api/customer-context?session_token=${storedToken}`);
-                if (contextResp.ok) {
-                  const contextData = await contextResp.json();
-                  if (contextData.has_context && contextData.summary) {
-                    // Build kiosk_summary from context API
+                console.log('[KioskChat] 🖥️ Fetching AI-powered customer summary for Kiosk...');
+                const summaryResp = await fetch(`${SALES_API}/api/chat-summary?session_token=${storedToken}&mode=kiosk`);
+                if (summaryResp.ok) {
+                  const summaryData = await summaryResp.json();
+                  if (summaryData.has_summary && summaryData.summary) {
+                    // Build kiosk_summary from Groq API
                     const kioskCtx = {
-                      type: 'customer_context',
-                      title: 'Customer Context',
-                      summary: contextData.summary.text,
+                      type: 'ai_summary',
+                      title: 'Customer Intelligence',
+                      summary: summaryData.summary,
                       details: {
-                        cart_items: contextData.summary.cart_items || 0,
-                        last_action: contextData.summary.last_action || 'browsing',
-                        products_viewed: contextData.last_products_viewed?.length || 0,
-                        previous_channels: contextData.summary.previous_channels || [],
-                        interaction_count: contextData.summary.interactions || 0
+                        cart_items: summaryData.cart_count || 0,
+                        loyalty_tier: summaryData.loyalty_tier || 'Member',
+                        loyalty_points: summaryData.loyalty_points || 0,
+                        mode: summaryData.mode
                       },
-                      cart: contextData.cart || [],
-                      last_recommended: contextData.last_products_viewed || []
+                      cart: restoredSession?.data?.cart || [],
+                      last_recommended: restoredSession?.data?.last_recommended_skus || []
                     };
                     setKioskSummary(kioskCtx);
-                    console.log('[KioskChat] ✅ Customer context loaded on restore:', kioskCtx);
+                    console.log('[KioskChat] ✅ AI-powered customer summary loaded:', kioskCtx);
                   }
                 }
               } catch (ctxErr) {
-                console.warn('[KioskChat] Could not fetch customer context:', ctxErr);
+                console.warn('[KioskChat] Could not fetch AI summary:', ctxErr);
               }
             }
 
@@ -723,6 +722,7 @@ const KioskChat = () => {
   // Previous phone input UI removed in favor of login-first flow
 
   const activeProfile = customerProfile || sessionInfo?.data?.customer_profile || null;
+  
   const displayName = activeProfile?.name?.trim() || 'Guest';
   const firstName = activeProfile?.name ? displayName.split(' ')[0] || displayName : 'Guest';
   const displayCity = activeProfile?.city?.trim() || '';
@@ -863,75 +863,113 @@ const KioskChat = () => {
       {/* Main Content Area */}
       <div className="flex-1 flex flex-col max-w-[1600px] mx-auto w-full px-8 py-6">
         
-        {/* Customer Context Summary Banner (Kiosk Only) */}
-        {kioskSummary && (
-          <div className="mb-4 bg-gradient-to-r from-blue-50 to-cyan-50 border-l-4 border-blue-500 rounded-lg p-5 shadow-md animate-fadeIn">
+        {/* Customer Intelligence Summary (Primary View for Sales Staff) */}
+        {kioskSummary ? (
+          <div className="mb-6 bg-gradient-to-r from-red-50 via-rose-50 to-pink-50 border-2 border-[#8B1538] rounded-2xl p-8 shadow-2xl animate-fadeIn">
             <div className="flex items-start justify-between">
               <div className="flex-1">
-                <div className="flex items-center gap-2 mb-3">
-                  <div className="w-8 h-8 bg-blue-500 rounded-full flex items-center justify-center">
-                    <User className="w-4 h-4 text-white" />
+                <div className="flex items-center gap-4 mb-5">
+                  <div className="w-14 h-14 bg-gradient-to-br from-[#8B1538] to-[#A91D3A] rounded-full flex items-center justify-center shadow-lg">
+                    <User className="w-7 h-7 text-white" />
                   </div>
-                  <h3 className="text-base font-bold text-blue-900">
-                    {kioskSummary.title || 'Customer Context'}
-                  </h3>
+                  <div className="flex-1">
+                    <h3 className="text-2xl font-bold text-[#8B1538] mb-1">
+                      {kioskSummary.title || 'Customer Intelligence'}
+                    </h3>
+                    <div className="flex items-center gap-3">
+                      <span className="text-sm bg-gradient-to-r from-[#8B1538] to-[#A91D3A] text-white px-4 py-1.5 rounded-full font-semibold shadow-md">
+                        🤖 AI-Powered Insights
+                      </span>
+                      {kioskSummary.details?.loyalty_tier && (
+                        <span className="text-sm bg-gradient-to-r from-[#D4AF37] to-[#F5DEB3] text-[#4e342e] px-4 py-1.5 rounded-full font-semibold shadow-md">
+                          ⭐ {kioskSummary.details.loyalty_tier} Member
+                        </span>
+                      )}
+                    </div>
+                  </div>
                 </div>
                 
-                <p className="text-sm text-blue-800 leading-relaxed mb-3">
-                  {kioskSummary.summary}
-                </p>
+                <div className="bg-white rounded-xl p-6 shadow-md border-2 border-[#ffe0b2] mb-5">
+                  <p className="text-lg text-gray-800 leading-relaxed font-medium whitespace-pre-wrap">
+                    {(() => {
+                      const cleanSummary = (kioskSummary.summary || '').replace(/\*\*/g, '');
 
-                <div className="flex flex-wrap gap-3 mb-3">
+                      // If name already present, don't duplicate
+                      if (cleanSummary.toLowerCase().includes(firstName.toLowerCase())) {
+                        return cleanSummary;
+                      }
+
+                      return `👋 ${firstName} is back in-store today.\n\n${cleanSummary}`;
+                    })()}
+                  </p>
+                </div>
+
+                <div className="flex flex-wrap gap-3 mb-5">
                   {kioskSummary.details?.cart_items > 0 && (
-                    <div className="flex items-center gap-1.5 bg-white px-3 py-1.5 rounded-full shadow-sm border border-blue-200">
-                      <ShoppingBag className="w-3.5 h-3.5 text-blue-600" />
-                      <span className="text-xs font-semibold text-blue-700">
+                    <div className="flex items-center gap-2 bg-gradient-to-r from-green-100 to-emerald-100 px-4 py-2.5 rounded-xl shadow-md border-2 border-green-400">
+                      <ShoppingBag className="w-5 h-5 text-green-700" />
+                      <span className="text-sm font-bold text-green-800">
                         {kioskSummary.details.cart_items} {kioskSummary.details.cart_items === 1 ? 'item' : 'items'} in cart
                       </span>
                     </div>
                   )}
                   
+                  {kioskSummary.details?.loyalty_points > 0 && (
+                    <div className="flex items-center gap-2 bg-gradient-to-r from-[#fef3c7] to-[#fde68a] px-4 py-2.5 rounded-xl shadow-md border-2 border-[#D4AF37]">
+                      <Award className="w-5 h-5 text-[#b45309]" />
+                      <span className="text-sm font-bold text-[#92400e]">
+                        {new Intl.NumberFormat('en-IN').format(kioskSummary.details.loyalty_points)} points available
+                      </span>
+                    </div>
+                  )}
+                  
                   {kioskSummary.details?.interaction_count > 0 && (
-                    <div className="flex items-center gap-1.5 bg-white px-3 py-1.5 rounded-full shadow-sm border border-blue-200">
-                      <div className="w-3.5 h-3.5 bg-blue-500 rounded-full"></div>
-                      <span className="text-xs font-semibold text-blue-700">
-                        {kioskSummary.details.interaction_count} interactions
+                    <div className="flex items-center gap-2 bg-gradient-to-r from-[#fce7f3] to-[#fbcfe8] px-4 py-2.5 rounded-xl shadow-md border-2 border-[#A91D3A]">
+                      <div className="w-5 h-5 bg-[#8B1538] rounded-full"></div>
+                      <span className="text-sm font-bold text-[#831843]">
+                        {kioskSummary.details.interaction_count} previous interactions
                       </span>
                     </div>
                   )}
 
                   {kioskSummary.details?.previous_channels?.length > 0 && (
-                    <div className="flex items-center gap-1.5 bg-white px-3 py-1.5 rounded-full shadow-sm border border-blue-200">
-                      <span className="text-xs text-blue-600">📱</span>
-                      <span className="text-xs font-semibold text-blue-700">
-                        {kioskSummary.details.previous_channels.join(', ')}
+                    <div className="flex items-center gap-2 bg-gradient-to-r from-blue-100 to-sky-100 px-4 py-2.5 rounded-xl shadow-md border-2 border-blue-400">
+                      <span className="text-lg">📱</span>
+                      <span className="text-sm font-bold text-blue-800">
+                        Used: {kioskSummary.details.previous_channels.join(', ')}
                       </span>
                     </div>
                   )}
 
                   {kioskSummary.details?.last_action && (
-                    <div className="flex items-center gap-1.5 bg-white px-3 py-1.5 rounded-full shadow-sm border border-blue-200">
-                      <span className="text-xs text-blue-600">🏷️</span>
-                      <span className="text-xs font-semibold text-blue-700">
-                        {kioskSummary.details.last_action.replace('_', ' ')}
+                    <div className="flex items-center gap-2 bg-gradient-to-r from-orange-100 to-red-100 px-4 py-2.5 rounded-xl shadow-md border-2 border-orange-400">
+                      <span className="text-lg">🏷️</span>
+                      <span className="text-sm font-bold text-orange-800">
+                        Last action: {kioskSummary.details.last_action.replace('_', ' ')}
                       </span>
                     </div>
                   )}
                 </div>
 
                 {kioskSummary.cart && kioskSummary.cart.length > 0 && (
-                  <div className="mt-3 bg-white rounded-lg p-3 border border-blue-200">
-                    <p className="text-xs font-bold text-blue-800 mb-2">Cart Items:</p>
-                    <div className="space-y-1.5">
+                  <div className="bg-white rounded-xl p-5 border-2 border-green-300 shadow-md mb-4">
+                    <p className="text-sm font-bold text-green-900 mb-3 flex items-center gap-2">
+                      <ShoppingBag className="w-4 h-4" />
+                      Cart Items:
+                    </p>
+                    <div className="space-y-2">
                       {kioskSummary.cart.slice(0, 3).map((item, idx) => (
-                        <div key={idx} className="flex items-center justify-between text-xs">
-                          <span className="text-blue-700 font-medium">• {item.name || item.sku}</span>
-                          <span className="text-blue-900 font-semibold">₹{item.price}</span>
+                        <div key={idx} className="flex items-center justify-between text-sm bg-gradient-to-r from-gray-50 to-green-50 rounded-lg p-3 border border-green-200">
+                          <span className="text-gray-700 font-medium flex-1">• {item.name || item.sku}</span>
+                          <span className="text-green-700 font-bold">₹{item.price}</span>
+                          {item.quantity > 1 && (
+                            <span className="text-xs text-gray-500 ml-2 bg-white px-2 py-1 rounded-full">x{item.quantity}</span>
+                          )}
                         </div>
                       ))}
                       {kioskSummary.cart.length > 3 && (
-                        <p className="text-xs text-blue-600 italic mt-1">
-                          +{kioskSummary.cart.length - 3} more items
+                        <p className="text-sm text-[#8B1538] italic mt-2 font-medium">
+                          +{kioskSummary.cart.length - 3} more items in cart
                         </p>
                       )}
                     </div>
@@ -939,26 +977,31 @@ const KioskChat = () => {
                 )}
 
                 {kioskSummary.details?.cart_items > 0 && (
-                  <div className="mt-3 inline-flex items-center gap-2 bg-green-100 px-3 py-1.5 rounded-full border border-green-300">
-                    <div className="w-2 h-2 bg-green-500 rounded-full animate-pulse"></div>
-                    <span className="text-xs font-bold text-green-800">✅ Ready to Checkout</span>
+                  <div className="inline-flex items-center gap-3 bg-gradient-to-r from-green-500 to-emerald-600 px-5 py-3 rounded-full border-2 border-green-400 shadow-lg">
+                    <div className="w-3 h-3 bg-white rounded-full animate-pulse"></div>
+                    <span className="text-sm font-bold text-white">✅ Customer Ready to Checkout</span>
                   </div>
                 )}
               </div>
 
-              <button
-                onClick={() => setKioskSummary(null)}
-                className="ml-4 p-1.5 hover:bg-blue-100 rounded-full transition-colors"
-                title="Dismiss summary"
-              >
-                <X className="w-4 h-4 text-blue-600" />
-              </button>
             </div>
+          </div>
+        ) : (
+          <div className="mb-6 bg-gradient-to-r from-gray-50 to-gray-100 border-2 border-gray-300 rounded-xl p-6 shadow-md">
+            <div className="flex items-center gap-3 mb-3">
+              <div className="w-10 h-10 bg-gray-400 rounded-full flex items-center justify-center">
+                <User className="w-5 h-5 text-white" />
+              </div>
+              <h3 className="text-lg font-bold text-gray-700">No Customer Context Available</h3>
+            </div>
+            <p className="text-sm text-gray-600 leading-relaxed">
+              This customer hasn't interacted with our platform before, or their session data is not available. You can start by asking what they're looking for today.
+            </p>
           </div>
         )}
         
-        {/* Chat Messages Area */}
-        <div className="flex-1 overflow-y-auto mb-6 px-4 space-y-4 scrollbar-thin scrollbar-thumb-gray-300 scrollbar-track-transparent">
+        {/* Chat Messages Area - HIDDEN FOR KIOSK (Summary-Only Mode) */}
+        <div className="hidden flex-1 overflow-y-auto mb-6 px-4 space-y-4 scrollbar-thin scrollbar-thumb-gray-300 scrollbar-track-transparent">
           {messages.map((message) => (
             <div
               key={message.id}

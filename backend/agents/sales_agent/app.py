@@ -220,6 +220,237 @@ async def health_check():
     }
 
 
+@app.get("/api/chat-summary")
+async def get_chat_summary(session_token: str, mode: str = "whatsapp"):
+    """
+    Generate AI-powered chat summary using Groq for WhatsApp/Kiosk channels.
+    Matches Telegram's warm, engaging summary style.
+    
+    Args:
+        session_token: Session token to fetch context for
+        mode: 'whatsapp' (second person) or 'kiosk' (third person)
+        
+    Returns:
+        AI-generated summary of customer's shopping journey
+    """
+    logger.info(f"💬 Generating {mode} chat summary for token: {session_token[:20]}...")
+    
+    try:
+        import httpx
+        
+        # Fetch session data
+        sess_resp = requests.get(
+            "http://localhost:8000/session/restore",
+            headers={"X-Session-Token": session_token},
+            timeout=8
+        )
+        
+        if sess_resp.status_code != 200:
+            return JSONResponse(
+                status_code=404,
+                content={"error": "Session not found", "has_summary": False}
+            )
+        
+        sess = sess_resp.json().get("session", {})
+        session_data = sess.get("data", {})
+        conversation_history = session_data.get("chat_context", [])
+        cart = session_data.get("cart", [])
+        summary = session_data.get("conversation_summary", "")
+        
+        # Extract customer name from multiple possible locations
+        customer_name = (
+            sess.get("customer_name") or 
+            session_data.get("customer_profile", {}).get("name") or
+            session_data.get("customer_name") or
+            "Customer"
+        )
+        customer_id = sess.get("customer_id") or session_data.get("customer_id")
+        
+        # Fetch REAL loyalty data from Loyalty Service
+        loyalty_tier = "Member"
+        loyalty_points = 0
+        if customer_id:
+            try:
+                logger.info(f"🏆 Fetching real loyalty data for customer {customer_id}...")
+                loyalty_resp = requests.get(
+                    f"http://localhost:8002/loyalty/tier/{customer_id}",
+                    timeout=5
+                )
+                if loyalty_resp.status_code == 200:
+                    loyalty_data = loyalty_resp.json()
+                    loyalty_tier = loyalty_data.get("tier", "Member")
+                    loyalty_points = loyalty_data.get("points", 0)
+                    logger.info(f"✅ Loyalty data fetched: {loyalty_tier}, {loyalty_points} points")
+                else:
+                    logger.warning(f"⚠️ Loyalty service returned {loyalty_resp.status_code}, using defaults")
+            except Exception as loyalty_err:
+                logger.warning(f"⚠️ Failed to fetch loyalty data: {loyalty_err}, using defaults")
+        
+        # Check if there's meaningful context
+        has_context = bool(summary or cart or len(conversation_history) > 0)
+        
+        if not has_context:
+            return {
+                "has_summary": False,
+                "message": "No previous interaction found"
+            }
+        
+        # Keep last 6 turns only
+        recent_history = conversation_history[-6:]
+        
+        # Extract product names from chat history (from cards metadata)
+        viewed_products = []
+        for msg in conversation_history:
+            if msg.get("metadata") and msg["metadata"].get("cards"):
+                for card in msg["metadata"]["cards"]:
+                    product_name = card.get("name")
+                    if product_name and product_name not in viewed_products:
+                        viewed_products.append(product_name)
+        
+        # Limit to last 5 unique products
+        viewed_products = viewed_products[-5:]
+        products_viewed_text = ", ".join(viewed_products) if viewed_products else "various products"
+        
+        # Build cart summary
+        cart_summary = []
+        for item in cart:
+            cart_summary.append(
+                f"{item.get('name')} (₹{item.get('price')} x {item.get('quantity', 1)})"
+            )
+        cart_text = ", ".join(cart_summary) if cart_summary else "No items in cart"
+        
+        # Build POV-specific prompts (matching Telegram's style)
+        if mode == "kiosk":
+            # Third person for kiosk (sales staff view)
+            system_prompt = """
+You are a retail intelligence assistant for sales staff at a premium fashion brand.
+Provide THIRD PERSON summaries of customer shopping behavior.
+Be professional, actionable, and insightful.
+Speak about "the customer" or "they" or use their name.
+Keep it under 120 words.
+Focus on what staff should know to provide excellent service.
+"""
+            user_prompt = f"""
+Customer Name: {customer_name}
+
+Products They Viewed: {products_viewed_text}
+
+Conversation Summary: {summary}
+
+Recent Chat History:
+{recent_history}
+
+Cart Items:
+{cart_text}
+
+Loyalty Tier: {loyalty_tier}
+Loyalty Points: {loyalty_points}
+
+Create a third-person customer intelligence summary for sales staff.
+Mention:
+- SPECIFIC product names they were exploring (use exact names from "Products They Viewed")
+- Current cart status (if any items)
+- Their loyalty tier and points balance
+- Key preferences or patterns noticed
+- Recommended approach to assist them
+
+Use a professional but warm tone. Make it actionable for staff.
+"""
+        else:
+            # Second person for WhatsApp (customer view - EXACT SAME AS TELEGRAM)
+            system_prompt = """
+You are a premium fashion sales assistant for a luxury brand.
+Your tone is warm, elegant, empathetic, and persuasive.
+Speak in SECOND PERSON.
+Be welcoming, stylish, and emotionally engaging.
+Focus on making the customer feel valued and excited about their shopping journey.
+
+"""
+            user_prompt = f"""
+Customer Name: {customer_name}
+
+Products They Viewed: {products_viewed_text}
+
+Conversation Summary: {summary}
+
+Recent Chat History:
+{recent_history}
+
+Cart Items:
+{cart_text}
+
+Loyalty Tier: {loyalty_tier}
+Loyalty Points: {loyalty_points}
+
+Create a personalized welcome-back summary.
+Mention:
+- SPECIFIC product names they were exploring (use exact names from "Products They Viewed")
+- Cart reminder (if any)
+- Their loyalty tier
+- Encourage continuation
+- Ask a soft engaging question
+
+IMPORTANT: Use the actual product names from "Products They Viewed" list. Be specific like "blue track pants" or "Women Boat-Neck Wildberry Sweatshirt".
+"""
+        
+        # Call Groq API
+        groq_api_key = os.getenv("GROQ_API_KEY")
+        if not groq_api_key:
+            # Fallback to simple summary
+            fallback = f"Welcome back {customer_name}! " if mode == "whatsapp" else f"Customer {customer_name} "
+            if cart:
+                fallback += f"has {len(cart)} item(s) in cart. "
+            if summary:
+                fallback += summary[:100]
+            return {
+                "has_summary": True,
+                "summary": fallback,
+                "mode": mode
+            }
+        
+        async with httpx.AsyncClient(timeout=20) as client:
+            response = await client.post(
+                "https://api.groq.com/openai/v1/chat/completions",
+                headers={
+                    "Authorization": f"Bearer {groq_api_key}",
+                    "Content-Type": "application/json"
+                },
+                json={
+                    "model": "llama-3.1-8b-instant",
+                    "messages": [
+                        {"role": "system", "content": system_prompt},
+                        {"role": "user", "content": user_prompt}
+                    ],
+                    "temperature": 0.7
+                }
+            )
+            
+            response.raise_for_status()
+            result = response.json()
+            summary_text = result["choices"][0]["message"]["content"].strip()
+            
+            logger.info(f"✅ Generated {mode} summary using Groq")
+            return {
+                "has_summary": True,
+                "summary": summary_text,
+                "mode": mode,
+                "cart_count": len(cart),
+                "loyalty_tier": loyalty_tier,
+                "loyalty_points": loyalty_points
+            }
+            
+    except Exception as e:
+        logger.error(f"❌ Failed to generate chat summary: {e}")
+        # Fallback
+        fallback = "Welcome back!" if mode == "whatsapp" else "Customer has previous interaction."
+        return {
+            "has_summary": True,
+            "summary": fallback,
+            "mode": mode,
+            "error": str(e)
+        }
+
+
 @app.get("/api/customer-context")
 async def get_customer_context(session_token: str):
     """
