@@ -548,11 +548,28 @@ async def process_telegram_message(telegram_message: TelegramMessage) -> bool:
                 image_url = card.get("image")
                 sku = card.get("sku", card.get("id"))
                 
+                # Get recommendation text/description
+                description = card.get("personalized_reason") or card.get("description") or card.get("gift_message") or ""
+                
+                # Build product URL for website
+                product_url = f"http://localhost:5173/products/{sku}" if sku else ""
+                
                 if image_url:
                     # Validate HTTPS before sending
                     if image_url.startswith(('https://', 'http://')):
-                        caption = f"*{product_name}*\n💰 ₹{product_price}"
-                        logger.info(f"🖼️ Sending product image: {image_url[:50]}...")
+                        # Build caption with name, price, description, and link
+                        caption_parts = [f"*{product_name}*", f"💰 ₹{product_price}"]
+                        
+                        if description:
+                            # Limit description to 200 chars to stay within Telegram caption limits
+                            description_text = description[:200] + "..." if len(description) > 200 else description
+                            caption_parts.append(f"\n{description_text}")
+                        
+                        if product_url:
+                            caption_parts.append(f"\n🔗 [View Product]({product_url})")
+                        
+                        caption = "\n".join(caption_parts)
+                        logger.info(f"🖼️ Sending product image with description: {image_url[:50]}...")
                         await send_telegram_photo(chat_id, image_url, caption)
                     else:
                         logger.warning(f"⚠️ Skipping invalid image URL: {image_url}")
@@ -578,40 +595,21 @@ async def process_telegram_message(telegram_message: TelegramMessage) -> bool:
                 buttons
             )
         
-        # 4. Add quick action buttons for products
-        elif cards and len(cards) > 0:
-            logger.info(f"🔘 Adding action buttons for {len(cards)} products...")
-            # Add "Buy Now" and "Add to Cart" buttons
-            buttons = []
-            for idx, card in enumerate(cards[:3]):  # Max 3 buttons
-                sku = card.get("sku", card.get("id"))
-                if sku:
-                    buttons.append([
-                        {
-                            "text": f"🛒 Add {card.get('name', 'Product')} to Cart",
-                            "callback_data": f"ADD_TO_CART|{sku}|1"
-                        },
-                        {
-                            "text": f"⚡ Buy {card.get('name', 'Product')} Now",
-                            "callback_data": f"BUY_NOW|{sku}|1"
-                        }
-                    ])
-            
-            # Add checkout button if cart exists
-            session_data = await get_session_data(session_token)
-            cart = session_data.get("data", {}).get("cart", []) if session_data else []
-            if cart:
-                buttons.append([{
-                    "text": "🛍️ Checkout",
+        # 4. Product links are now included in photo captions above
+        # No need for separate action buttons - removed as per requirement
+        
+        # Add checkout button if cart exists (kept for cart management)
+        session_data = await get_session_data(session_token)
+        cart = session_data.get("data", {}).get("cart", []) if session_data else []
+        if cart:
+            await send_inline_keyboard(
+                chat_id,
+                "Quick actions:",
+                [[{
+                    "text": "🛒 Checkout",
                     "callback_data": "CHECKOUT"
-                }])
-            
-            if buttons:
-                await send_inline_keyboard(
-                    chat_id,
-                    "Quick actions:",
-                    buttons
-                )
+                }]]
+            )
 
         logger.info(f"✅ Processed Telegram message from chat {chat_id}")
         return True
