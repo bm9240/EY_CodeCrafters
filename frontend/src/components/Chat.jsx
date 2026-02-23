@@ -449,6 +449,30 @@ const Chat = () => {
   };
 
   // Session Management Functions
+  const fetchAndDisplayChatSummary = async (sessionToken) => {
+    try {
+      const summaryResp = await fetch(`${SALES_API}/api/chat-summary?session_token=${sessionToken}&mode=whatsapp`);
+      if (summaryResp.ok) {
+        const summaryData = await summaryResp.json();
+        if (summaryData.has_summary && summaryData.summary) {
+          // Add summary as first agent message
+          const summaryMessage = {
+            id: 0, // Special ID to keep it at top
+            text: summaryData.summary,
+            sender: 'agent',
+            timestamp: new Date().toLocaleTimeString('en-US', { hour: '2-digit', minute: '2-digit' }),
+            status: 'delivered',
+            metadata: { type: 'chat_summary' }
+          };
+          return summaryMessage;
+        }
+      }
+    } catch (err) {
+      console.warn('Failed to fetch chat summary:', err);
+    }
+    return null;
+  };
+
   const startOrRestoreSession = async () => {
     setIsLoadingSession(true);
     try {
@@ -483,7 +507,12 @@ const Chat = () => {
               await fetchLoyaltyPoints(resolvedUserId);
             }
 
-            if (restoreData.session.data?.chat_context?.length) {
+            // Restore chat history for returning users
+            const hasHistory = restoreData.session.data?.chat_context?.length > 0;
+            const hasCart = restoreData.session.data?.cart?.length > 0;
+            
+            if (hasHistory) {
+              console.log('📚 Restoring chat history...');
               const chatMessages = restoreData.session.data.chat_context.map((msg, idx) => ({
                 id: idx + 1,
                 text: msg.message,
@@ -493,80 +522,53 @@ const Chat = () => {
                 cards: msg.metadata?.cards || []
               }));
               
-              // Check for pending payment success message from navigation state
-              if (location.state?.paymentSuccess && location.state?.message && !paymentMessageHandledRef.current) {
-                paymentMessageHandledRef.current = true;
-                const paymentMessage = {
-                  id: chatMessages.length + 1,
-                  text: location.state.message,
-                  sender: 'agent',
-                  timestamp: new Date().toLocaleTimeString('en-US', { hour: '2-digit', minute: '2-digit' }),
-                  status: 'delivered',
-                  metadata: { type: 'payment_success', orderId: location.state.orderId, paymentId: location.state.paymentId }
-                };
-                chatMessages.push(paymentMessage);
-                navigate(location.pathname, { replace: true, state: {} });
-              }
-              
-              // Check for post-purchase request from navigation state
-              if (location.state?.postPurchaseRequest && !postPurchaseHandledRef.current) {
-                postPurchaseHandledRef.current = true;
-                const postPurchaseMessage = {
-                  id: chatMessages.length + 1,
-                  text: `📦 Post-Purchase Support for Order ${location.state.orderId}\n\nHow can I help you today? Please select an option:`,
-                  sender: 'agent',
-                  timestamp: new Date().toLocaleTimeString('en-US', { hour: '2-digit', minute: '2-digit' }),
-                  status: 'delivered',
-                  postPurchaseOptions: {
-                    orderId: location.state.orderId,
-                    orderItems: location.state.orderItems,
-                    userId: location.state.userId,
-                    productName: location.state.orderItems?.[0]?.name || null
-                  }
-                };
-                chatMessages.push(postPurchaseMessage);
-                navigate(location.pathname, { replace: true, state: {} });
-              }
-              
-              // Check for stylist request from navigation state
-              if (location.state?.stylistRequest && !stylistHandledRef.current) {
-                stylistHandledRef.current = true;
-                const stylistMessage = {
-                  id: chatMessages.length + 1,
-                  text: `👗 Fetching personalized styling suggestions for your order...`,
-                  sender: 'agent',
-                  timestamp: new Date().toLocaleTimeString('en-US', { hour: '2-digit', minute: '2-digit' }),
-                  status: 'delivered',
-                  metadata: { 
-                    type: 'stylist_request',
-                    orderId: location.state.orderId,
-                    product: location.state.product
-                  },
-                  stylistPending: true,
-                  stylistProduct: location.state.product
-                };
-                chatMessages.push(stylistMessage);
-                navigate(location.pathname, { replace: true, state: {} });
+              // Add AI-powered welcome summary as the LAST message for returning users
+              if (hasHistory || hasCart) {
+                console.log('📨 Fetching AI summary to append as last message...');
+                const summaryMessage = await fetchAndDisplayChatSummary(storedToken);
+                if (summaryMessage) {
+                  chatMessages.push({
+                    ...summaryMessage,
+                    id: chatMessages.length + 1
+                  });
+                  console.log('✅ Chat history restored + summary appended as last message');
+                }
               }
               
               setMessages(chatMessages);
-            } else if (location.state?.paymentSuccess && location.state?.message && !paymentMessageHandledRef.current) {
-              // No chat context but payment message exists
-              paymentMessageHandledRef.current = true;
+            } else {
+              // New user - show welcome message
               setMessages([{
                 id: 1,
+                text: `Welcome to WhatsApp Shopping! I'm your personal shopping assistant. How can I help you today?`,
+                sender: 'agent',
+                timestamp: new Date().toLocaleTimeString('en-US', { hour: '2-digit', minute: '2-digit' }),
+                status: 'delivered'
+              }]);
+            }
+            
+            // Handle special navigation states (payment success, post-purchase, stylist)
+            const currentMessages = [];
+            
+            // Check for payment success message from navigation state
+            if (location.state?.paymentSuccess && location.state?.message && !paymentMessageHandledRef.current) {
+              paymentMessageHandledRef.current = true;
+              currentMessages.push({
+                id: Date.now(),
                 text: location.state.message,
                 sender: 'agent',
                 timestamp: new Date().toLocaleTimeString('en-US', { hour: '2-digit', minute: '2-digit' }),
                 status: 'delivered',
                 metadata: { type: 'payment_success', orderId: location.state.orderId, paymentId: location.state.paymentId }
-              }]);
+              });
               navigate(location.pathname, { replace: true, state: {} });
-            } else if (location.state?.postPurchaseRequest && !postPurchaseHandledRef.current) {
-              // No chat context but post-purchase request exists
+            }
+            
+            // Check for post-purchase request
+            if (location.state?.postPurchaseRequest && !postPurchaseHandledRef.current) {
               postPurchaseHandledRef.current = true;
-              setMessages([{
-                id: 1,
+              currentMessages.push({
+                id: Date.now() + 1,
                 text: `📦 Post-Purchase Support for Order ${location.state.orderId}\n\nHow can I help you today? Please select an option:`,
                 sender: 'agent',
                 timestamp: new Date().toLocaleTimeString('en-US', { hour: '2-digit', minute: '2-digit' }),
@@ -577,13 +579,15 @@ const Chat = () => {
                   userId: location.state.userId,
                   productName: location.state.orderItems?.[0]?.name || null
                 }
-              }]);
+              });
               navigate(location.pathname, { replace: true, state: {} });
-            } else if (location.state?.stylistRequest && !stylistHandledRef.current) {
-              // No chat context but stylist request exists
+            }
+            
+            // Check for stylist request
+            if (location.state?.stylistRequest && !stylistHandledRef.current) {
               stylistHandledRef.current = true;
-              setMessages([{
-                id: 1,
+              currentMessages.push({
+                id: Date.now() + 2,
                 text: `👗 Fetching personalized styling suggestions for your order...`,
                 sender: 'agent',
                 timestamp: new Date().toLocaleTimeString('en-US', { hour: '2-digit', minute: '2-digit' }),
@@ -595,9 +599,15 @@ const Chat = () => {
                 },
                 stylistPending: true,
                 stylistProduct: location.state.product
-              }]);
+              });
               navigate(location.pathname, { replace: true, state: {} });
             }
+            
+            // Append special state messages if any
+            if (currentMessages.length > 0) {
+              setMessages(prev => [...prev, ...currentMessages]);
+            }
+            
             return;
           }
         } catch (err) {
