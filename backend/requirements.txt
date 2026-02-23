@@ -55,3 +55,5 @@ torchvision
 pillow
 opencv-contrib-python
 faiss-cpu
+supabase
+

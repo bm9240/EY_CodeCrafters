@@ -2,7 +2,8 @@ import { useState, useEffect } from 'react';
 import { useNavigate } from 'react-router-dom';
 import { useCart } from '@/contexts/CartContext.jsx';
 import { ShoppingCart, Trash2, Plus, Minus, ArrowLeft } from 'lucide-react';
-import inventoryService from '@/services/inventoryService';
+import storeService from '@/services/storeService';
+import sessionStore from '@/lib/session';
 import Navbar from '@/components/Navbar.jsx';
 
 const CartPage = () => {
@@ -18,7 +19,8 @@ const CartPage = () => {
 
   const [reserveLoading, setReserveLoading] = useState({});
   const [reserveFeedback, setReserveFeedback] = useState({});
-  const [storeOptions, setStoreOptions] = useState({});
+  const [stores, setStores] = useState([]);
+  const [storesLoading, setStoresLoading] = useState(true);
   const [selectedStore, setSelectedStore] = useState({});
   // Address management (stored in localStorage under 'ey_addresses')
   const [addresses, setAddresses] = useState(() => {
@@ -33,6 +35,51 @@ const CartPage = () => {
   const [editingAddress, setEditingAddress] = useState(null);
   const [selectAddressModalOpen, setSelectAddressModalOpen] = useState(false);
   const [selectedAddressId, setSelectedAddressId] = useState(null);
+
+  // Load stores from Supabase on component mount
+  useEffect(() => {
+    const loadStores = async () => {
+      try {
+        setStoresLoading(true);
+        console.log('📦 Loading stores from Sales Agent...');
+        const storesData = await storeService.getStores();
+        console.log('✅ Raw stores response:', storesData);
+        
+        // Handle both array and wrapped response
+        let storesArray = [];
+        if (Array.isArray(storesData)) {
+          storesArray = storesData;
+        } else if (storesData?.stores && Array.isArray(storesData.stores)) {
+          storesArray = storesData.stores;
+        } else {
+          console.warn('⚠️ Unexpected stores format:', storesData);
+          storesArray = [];
+        }
+        
+        // Log each store to see what fields are present
+        console.log(`📍 Total stores: ${storesArray.length}`);
+        storesArray.forEach((store, idx) => {
+          console.log(`  Store ${idx}:`, {
+            id: store.id,
+            name: store.name,
+            location: store.location,
+            city: store.city,
+            state: store.state,
+            raw: store
+          });
+        });
+        
+        setStores(storesArray);
+      } catch (error) {
+        console.error('❌ Failed to load stores from Supabase:', error);
+        setStores([]);
+      } finally {
+        setStoresLoading(false);
+      }
+    };
+    
+    loadStores();
+  }, []);
 
   const saveAddresses = (next) => {
     setAddresses(next);
@@ -69,7 +116,8 @@ const CartPage = () => {
     }
 
     try {
-      await inventoryService.releaseInventory(item.reservationHoldId);
+      // Call Sales Agent to release the hold
+      await storeService.releaseReservation(item.reservationHoldId);
       setReserveFeedback((prev) => ({
         ...prev,
         [item.id]: 'Reservation released',
@@ -89,94 +137,95 @@ const CartPage = () => {
     if (!item || item.qty <= 0) return;
 
     setReserveLoading((prev) => ({ ...prev, [item.id]: true }));
-    let location = 'store:STORE_MUMBAI';
+    
     try {
-      const inventorySnapshot = await inventoryService.getInventory(item.sku);
-      const stores = inventorySnapshot.store_stock || {};
-      const userSelected = selectedStore[item.sku];
-      if (userSelected) {
-        location = userSelected === 'online' ? 'online' : `store:${userSelected}`;
-      } else {
-        const matchingStore = Object.keys(stores).find((s) => stores[s] >= item.qty);
-        if (matchingStore) {
-          location = `store:${matchingStore}`;
-        } else if ((inventorySnapshot.online_stock || 0) >= item.qty) {
-          location = 'online';
+      // Get selected store or first available store
+      let selectedStoreLocation = selectedStore[item.sku];
+      
+      if (!selectedStoreLocation) {
+        if (stores.length === 0) {
+          throw new Error('No stores available for reservation');
         }
+        selectedStoreLocation = stores[0].location;
+        setSelectedStore((prev) => ({ ...prev, [item.sku]: selectedStoreLocation }));
       }
 
-      if (item.reservationHoldId) {
-        await inventoryService.releaseInventory(item.reservationHoldId);
+      // Get customer ID
+      const customerId = sessionStore.getCustomerId();
+      if (!customerId) {
+        throw new Error('Customer not authenticated');
       }
 
-      const response = await inventoryService.holdInventory({
+      // Call Sales Agent reservation endpoint (complete orchestration)
+      const reservation = await storeService.reserveInStore({
+        customer_id: String(customerId),  // Convert to string
         sku: item.sku,
         quantity: item.qty,
-        location,
-        ttl: 1800,
+        store_location: selectedStoreLocation
       });
 
+      // Check if reservation was successful
+      if (reservation.status !== 'reserved') {
+        const errorMsg = reservation.message || `Reservation failed: ${reservation.status}`;
+        setReserveFeedback((prev) => ({
+          ...prev,
+          [item.id]: errorMsg,
+        }));
+        setReserveLoading((prev) => ({ ...prev, [item.id]: false }));
+        return;
+      }
+
+      // Update item with reservation metadata
       updateItemMetadata(item.id, {
         reservationStatus: 'reserved',
-        reservationHoldId: response.hold_id,
-        reservationExpiresAt: response.expires_at,
-        reservationLocation: location,
+        reservationHoldId: reservation.hold_id,
+        reservationExpiresAt: reservation.expires_at,
+        reservationLocation: `store:${selectedStoreLocation}`,
         reservedQuantity: item.qty,
       });
 
+      // Store reservation in localStorage for "My Reservations" view
+      const storedReservations = JSON.parse(localStorage.getItem('ey_reservations') || '[]');
+      storedReservations.push({
+        reservation_id: reservation.reservation_id,
+        customer_id: customerId,
+        sku: item.sku,
+        quantity: item.qty,
+        store_location: selectedStoreLocation,
+        hold_id: reservation.hold_id,
+        status: 'confirmed',
+        created_at: new Date().toISOString(),
+        expires_at: reservation.expires_at,
+        product_name: item.name,
+        product_image: item.image,
+        store_name: reservation.store_name,
+      });
+      localStorage.setItem('ey_reservations', JSON.stringify(storedReservations));
+
+      // Remove item from active cart after successful reservation
+      removeFromCart(item.id);
+
       setReserveFeedback((prev) => ({
         ...prev,
-        [item.id]: 'Your product is reserved in store.',
+        [item.id]: `✓ Reserved at ${reservation.store_name}! Confirmation: ${reservation.reservation_id}`,
       }));
+
+      // Brief delay before clearing feedback
+      setTimeout(() => {
+        setReserveFeedback((prev) => {
+          const next = { ...prev };
+          delete next[item.id];
+          return next;
+        });
+      }, 3000);
     } catch (error) {
       console.error('Reservation failed:', error);
 
-      const isConflict =
-        (error && error.status === 409) ||
-        (error && typeof error.message === 'string' && error.message.includes('409')) ||
-        (error && String(error).includes('409'));
-
-      // Prefer information from error body when available
-      const errorBody = error && error.body ? error.body : null;
-
-      if (isConflict) {
-        try {
-          // If backend included inventory snapshot in error body, use it; else fetch
-          const inventory = errorBody && (errorBody.inventory || errorBody.data)
-            ? (errorBody.inventory || errorBody.data)
-            : await inventoryService.getInventory(item.sku);
-
-          const stores = inventory.store_stock || {};
-          const storeEntries = Object.entries(stores)
-            .filter(([, qty]) => qty > 0)
-            .sort((a, b) => b[1] - a[1]);
-
-          let suggestion;
-          if (storeEntries.length > 0) {
-            const top = storeEntries.slice(0, 2).map(([s, q]) => `${s} (${q})`).join(', ');
-            suggestion = `Not enough stock at the selected location. Available at: ${top}.`;
-          } else if ((inventory.online_stock || 0) > 0) {
-            suggestion = `No stock in stores for this SKU. ${inventory.online_stock} available online.`;
-          } else {
-            suggestion = 'Product is out of stock.';
-          }
-
-          setReserveFeedback((prev) => ({
-            ...prev,
-            [item.id]: suggestion,
-          }));
-        } catch (e) {
-          setReserveFeedback((prev) => ({
-            ...prev,
-            [item.id]: 'Unable to reserve product. Please try again.',
-          }));
-        }
-      } else {
-        setReserveFeedback((prev) => ({
-          ...prev,
-          [item.id]: (errorBody && (errorBody.message || errorBody.error)) || error?.message || 'Unable to reserve product. Please try again.',
-        }));
-      }
+      const errorMessage = error?.message || 'Unable to reserve product. Please try again.';
+      setReserveFeedback((prev) => ({
+        ...prev,
+        [item.id]: errorMessage,
+      }));
 
       resetReservationMetadata(item.id);
     } finally {
@@ -220,7 +269,7 @@ const CartPage = () => {
       );
 
       if (!mounted) return;
-      setStoreOptions((prev) => ({ ...prev, ...nextOptions }));
+      // Use nextSelected to initialize store selection but don't need storeOptions
       setSelectedStore((prev) => ({ ...prev, ...nextSelected }));
     };
 
@@ -395,20 +444,29 @@ const CartPage = () => {
                     <div className="mt-4 space-y-2">
                       {/* Store selector for reservation */}
                       <div className="flex items-center gap-2">
+                        <label className="text-sm font-medium text-gray-700 min-w-fit">Select Store:</label>
                         <select
                           value={selectedStore[item.sku] || ''}
-                          onChange={(e) => setSelectedStore((prev) => ({ ...prev, [item.sku]: e.target.value }))}
-                          className="border px-3 py-2 rounded-md text-sm"
+                          onChange={(e) => {
+                            console.log('📍 Store selected:', e.target.value, 'for SKU:', item.sku);
+                            setSelectedStore((prev) => ({ ...prev, [item.sku]: e.target.value }));
+                          }}
+                          disabled={storesLoading || stores.length === 0}
+                          className="flex-1 border border-gray-300 px-3 py-2 rounded-md text-sm bg-white hover:border-gray-400 disabled:bg-gray-100 disabled:cursor-not-allowed"
                         >
-                          {(storeOptions[item.sku] || []).length > 0 ? (
-                            (storeOptions[item.sku] || []).map((s) => (
-                              <option key={s} value={s}>
-                                {s}
+                          <option value="">
+                            {storesLoading ? 'Loading stores...' : stores.length === 0 ? 'No stores available' : 'Select a store'}
+                          </option>
+                          {stores.map((store) => {
+                            console.log('🏬 Rendering store option:', store);
+                            const displayName = store.name || store.location || store.id || 'Unknown Store';
+                            const storeValue = store.location || store.id;
+                            return (
+                              <option key={storeValue} value={storeValue}>
+                                {displayName}
                               </option>
-                            ))
-                          ) : (
-                            <option value="" disabled>No stores available</option>
-                          )}
+                            );
+                          })}
                         </select>
                       </div>
 

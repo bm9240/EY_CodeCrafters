@@ -13,6 +13,8 @@ import ProductDetail from './components/pages/ProductDetail';
 import Wishlist from './components/pages/Wishlist';
 import OrdersPage from './components/pages/OrdersPage';
 import OrderDetailPage from './components/pages/OrderDetailPage';
+import AdminDashboard from './components/pages/AdminDashboard';
+import MyReservations from './components/pages/MyReservations';
 
 function App() {
   return (
@@ -33,6 +35,8 @@ function App() {
             <Route path="/checkout" element={<CheckoutPage />} />
             <Route path="/orders" element={<OrdersPage />} />
             <Route path="/orders/:id" element={<OrderDetailPage />} />
+            <Route path="/reservations" element={<MyReservations />} />
+            <Route path="/admin" element={<AdminDashboard />} />
           </Routes>
         </div>
         </Router>

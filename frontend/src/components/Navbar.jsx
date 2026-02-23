@@ -250,8 +250,12 @@ const Navbar = () => {
                       className="w-full text-left px-3 py-2 rounded hover:bg-red-50"
                     >
                       Orders
-                    </button>
-                    <button
+                    </button>                    <button
+                      onClick={() => { setProfileMenuOpen(false); navigate('/reservations'); }}
+                      className="w-full text-left px-3 py-2 rounded hover:bg-red-50"
+                    >
+                      My Reservations
+                    </button>                    <button
                       onClick={handleLogout}
                       className="w-full text-left px-3 py-2 rounded text-red-700 hover:bg-red-50 font-medium"
                     >

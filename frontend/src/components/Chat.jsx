@@ -245,28 +245,31 @@ const Chat = () => {
 
           const orderId = payload.order_id;
           const fulfillment = payload.fulfillment || {};
-          const status = fulfillment.current_status || 'UNKNOWN';
+          const rawStatus = fulfillment.current_status || 'UNKNOWN';
+          const status = String(rawStatus).replace('FulfillmentStatus.', '').toUpperCase();
 
           const statusMessages = {
-            PROCESSING: '📦 Your order is being processed and packed.',
-            PACKED: '✅ Your order has been packed and is ready for shipment.',
-            SHIPPED: '🚚 Your order has been shipped!',
-            OUT_FOR_DELIVERY: '🏃 Your order is out for delivery!',
-            DELIVERED: '🎉 Your order has been delivered!',
+            PROCESSING: '📦 Your order is being carefully prepared with utmost care.\n\nOur team is picking and packing your items to ensure they arrive in perfect condition!',
+            PACKED: '✅ Great news! Your order has been packed and sealed.\n\nIt\'s now in our logistics network and will be picked up soon for shipment!',
+            SHIPPED: '🚚 Your order is on the move!\n\nYour package is now with our carrier and heading towards your doorstep. Exciting times ahead! 📍',
+            OUT_FOR_DELIVERY: '🏃🎯 Your delivery partner is on the way!\n\nYour order is out for delivery today. Please keep your phone handy for the delivery partner\'s call.',
+            DELIVERED: '🎉🌟 Success! Your order has been delivered!\n\nThank you for shopping with us! We hope you love your new purchase. Don\'t forget to share your photos and feedback with our community! 💝',
           };
 
           let responseText = `Order ${orderId}:\n\n${statusMessages[status] || `Status: ${status}`}`;
 
           if (status === 'OUT_FOR_DELIVERY') {
             if (fulfillment.delivery_boy_name) {
-              responseText += `\n\n👤 Delivery Partner: ${fulfillment.delivery_boy_name}`;
+              responseText += `\n\n👤 Your Delivery Partner: ${fulfillment.delivery_boy_name}`;
             }
             if (fulfillment.delivery_boy_phone) {
-              responseText += `\n📱 Phone: ${fulfillment.delivery_boy_phone}`;
+              responseText += `\n📱 Contact: ${fulfillment.delivery_boy_phone} (Ready to assist)`;
             }
             if (fulfillment.delivery_otp) {
-              responseText += `\n🔐 OTP for Verification: ${fulfillment.delivery_otp}`;
+              responseText += `\n🔐 Verification OTP: ${fulfillment.delivery_otp}\n\n💡 Share this OTP only with your delivery partner for verification.`;
             }
+          } else if (status === 'DELIVERED') {
+            responseText += `\n\n⭐ We'd love your feedback! Rate and review your purchase.`;
           }
 
           appendAgentMessage(responseText);
@@ -404,8 +407,34 @@ const Chat = () => {
     return String(text).replace(/^\s*["'“”]+|["'“”]+\s*$/g, '').trim();
   };
 
-  const renderMessageText = (text) => {
+  const renderMessageText = (text, metadata = {}) => {
     if (!text) return null;
+    
+    // Special formatting for payment success messages
+    if (metadata?.type === 'payment_success') {
+      const lines = String(text).split('\n');
+      return (
+        <div className="space-y-2">
+          {lines.map((line, idx) => {
+            if (line.includes('Order ID:') || line.includes('Payment ID:') || line.includes('Amount:')) {
+              const [label, value] = line.split(':');
+              return (
+                <div key={`payment-line-${idx}`} className="flex items-start gap-2">
+                  <span className="font-semibold text-orange-600">{label}:</span>
+                  <span className="font-mono text-gray-700">{value}</span>
+                </div>
+              );
+            }
+            return (
+              <div key={`payment-text-${idx}`} className={`${line.trim() === '' ? 'h-2' : ''}`}>
+                {line.trim() && renderMessageText(line)}
+              </div>
+            );
+          })}
+        </div>
+      );
+    }
+    
     const parts = String(text).split(/\*\*(.*?)\*\*/g);
     return parts.map((part, index) => (
       index % 2 === 1
@@ -2371,8 +2400,8 @@ const Chat = () => {
             >
               <div className="text-sm leading-relaxed whitespace-pre-wrap break-words">
                 {message.text && message.text.length > 800 && !expandedMessages.has(message.id)
-                  ? renderMessageText(`${message.text.slice(0, 380)}... `)
-                  : renderMessageText(message.text)}
+                  ? renderMessageText(`${message.text.slice(0, 380)}... `, message.metadata)
+                  : renderMessageText(message.text, message.metadata)}
                 {message.text && message.text.length > 800 && (
                   <button
                     onClick={() => toggleExpandMessage(message.id)}

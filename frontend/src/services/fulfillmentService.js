@@ -26,7 +26,9 @@ export const startFulfillment = async (fulfillmentData) => {
  * @returns {Promise<Object>} Fulfillment details
  */
 export const getFulfillmentStatus = async (orderId) => {
-  return apiCall(`${API_ENDPOINTS.FULFILLMENT_STATUS}/${orderId}`);
+  const response = await apiCall(`${API_ENDPOINTS.FULFILLMENT_STATUS}/${orderId}`);
+  // Unwrap the fulfillment object from the API response
+  return response?.fulfillment || response;
 };
 
 /**

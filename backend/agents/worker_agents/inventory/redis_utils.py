@@ -143,6 +143,10 @@ def get_stock(sku: str) -> dict:
             "stores": {"store_id": int, ...}
         }
     """
+    # Normalize SKU to uppercase for consistency
+    sku_normalized = sku.upper()
+    print(f"\n🔍 [DEBUG] get_stock called with sku={sku}, normalized={sku_normalized}")
+    
     # Try Supabase first (when enabled)
     try:
         import sys
@@ -154,15 +158,26 @@ def get_stock(sku: str) -> dict:
         
         from db.repositories import inventory_repo
         
-        supabase_result = inventory_repo.get_stock(sku)
+        # Try with normalized SKU
+        supabase_result = inventory_repo.get_stock(sku_normalized)
         if supabase_result is not None:
-            print(f"✅ Source: SUPABASE for SKU={sku}")
+            print(f"✅ Source: SUPABASE for SKU={sku_normalized}, stores={supabase_result.get('stores', {})}")
             return {
                 "online": supabase_result.get("online", 0),
                 "stores": supabase_result.get("stores", {})
             }
+        else:
+            # If normalized didn't work, try original
+            supabase_result = inventory_repo.get_stock(sku)
+            if supabase_result is not None:
+                print(f"✅ Source: SUPABASE (original case) for SKU={sku}, stores={supabase_result.get('stores', {})}")
+                return {
+                    "online": supabase_result.get("online", 0),
+                    "stores": supabase_result.get("stores", {})
+                }
+            print(f"⚠️ Supabase returned None for both {sku_normalized} and {sku}, falling back to Redis/CSV")
     except Exception as e:
-        print(f"⚠️ Supabase read failed for SKU={sku}: {e}")
+        print(f"⚠️ Supabase read failed for SKU={sku}: {e}, falling back to Redis/CSV")
     
     # Fallback to Redis
     print(f"📦 Source: REDIS/CSV fallback for SKU={sku}")
@@ -170,71 +185,153 @@ def get_stock(sku: str) -> dict:
     result = {"online": 0, "stores": {}}
 
     if redis_client:
-        online_stock = redis_client.get(get_stock_key(sku, "online"))
-        result["online"] = int(online_stock) if online_stock else 0
+        # Try both normalized and original SKU
+        for sku_variant in [sku_normalized, sku]:
+            online_stock = redis_client.get(get_stock_key(sku_variant, "online"))
+            if online_stock:
+                result["online"] = int(online_stock)
+                print(f"  Found online stock using sku={sku_variant}: {result['online']}")
+                break
+        
+        if result["online"] == 0:
+            online_stock = redis_client.get(get_stock_key(sku, "online"))
+            result["online"] = int(online_stock) if online_stock else 0
+            print(f"  Redis online stock: {result['online']}")
 
-        pattern = f"stock:{sku}:store:*"
-        store_keys = redis_client.keys(pattern)
-        for key in store_keys:
-            store_id = key.split(":")[-1]
-            stock = redis_client.get(key)
-            result["stores"][store_id] = int(stock) if stock else 0
+        # Search for store keys with both variants
+        for sku_variant in [sku_normalized, sku]:
+            pattern = f"stock:{sku_variant}:store:*"
+            print(f"  Searching Redis pattern: {pattern}")
+            store_keys = redis_client.keys(pattern)
+            if store_keys:
+                print(f"  Found Redis keys: {store_keys}")
+                for key in store_keys:
+                    store_id = key.split(":")[-1]
+                    stock = redis_client.get(key)
+                    result["stores"][store_id] = int(stock) if stock else 0
+                    print(f"    {store_id}: {result['stores'][store_id]}")
+                if result["stores"]:
+                    break
+        
+        if result["stores"]:
+            print(f"✓ Found store stock from Redis")
+        else:
+            print(f"⚠️ No store stock found in Redis")
         return result
 
     # In-memory fallback
+    print(f"  Using in-memory fallback")
     with _LOCK:
-        online_key = get_stock_key(sku, "online")
-        result["online"] = int(_IN_MEMORY_STOCK.get(online_key, 0))
+        for sku_variant in [sku_normalized, sku]:
+            online_key = get_stock_key(sku_variant, "online")
+            result["online"] = int(_IN_MEMORY_STOCK.get(online_key, 0))
+            if result["online"] > 0:
+                print(f"    Online (variant {sku_variant}): {result['online']}")
+                break
+        
+        if result["online"] == 0:
+            result["online"] = int(_IN_MEMORY_STOCK.get(get_stock_key(sku, "online"), 0))
 
-        prefix = f"stock:{sku}:store:"
-        for key, value in _IN_MEMORY_STOCK.items():
-            if key.startswith(prefix):
-                store_id = key[len(prefix):]
-                result["stores"][store_id] = int(value)
+        for sku_variant in [sku_normalized, sku]:
+            prefix = f"stock:{sku_variant}:store:"
+            for key, value in _IN_MEMORY_STOCK.items():
+                if key.startswith(prefix):
+                    store_id = key[len(prefix):]
+                    result["stores"][store_id] = int(value)
+                    print(f"    {store_id} (variant {sku_variant}): {result['stores'][store_id]}")
+            if result["stores"]:
+                break
+    
+    print(f"Final result: online={result['online']}, stores={result['stores']}\n")
     return result
 
 
 def hold_stock_atomic(sku: str, quantity: int, location: str = "online") -> int:
     """
-    Atomically decrement stock using Lua script.
+    Atomically hold stock in Redis.
+    
+    Flow:
+    1. Query Supabase (source of truth with all 4000 products) for available stock
+    2. Validate enough stock is available in Supabase
+    3. Initialize Redis with Supabase value if not already there
+    4. Create hold in Redis (atomic decrement via Lua script)
+    5. Return remaining stock in Redis
+    
+    Note: Redis is used for TEMPORARY HOLDS ONLY (TTL-based)
+          Supabase is the source of truth for product availability
     
     Returns:
-        Remaining stock if successful, -1 if insufficient stock
+        Remaining stock in Redis if successful, -1 if insufficient stock in Supabase
     """
+    # Normalize SKU (trim and uppercase for consistency)
+    sku_normalized = sku.strip().upper()
+    print(f"✓ Normalized SKU in hold_stock_atomic: {sku} → {sku_normalized}")
+    
+    # Extract store ID from location if it's a store location
+    store_id = None
+    location_for_redis = location
+    if location.startswith("store:"):
+        store_id = location.split(":", 1)[1].strip().upper()
+    
+    # STEP 1: Fetch current stock from Supabase (source of truth - has all 4000 products)
+    supabase_stock = 0
+    try:
+        from db.repositories import inventory_repo
+        stock_data = inventory_repo.get_stock(sku_normalized)
+        
+        print(f"✓ Stock data from Supabase: {stock_data}")
+        
+        if location_for_redis == "online":
+            supabase_stock = stock_data.get("online", 0) if stock_data else 0
+        elif store_id and stock_data and stock_data.get("stores"):
+            supabase_stock = stock_data["stores"].get(store_id, 0)
+        
+        print(f"✓ Supabase stock for {sku_normalized} at {location_for_redis}: {supabase_stock} units")
+    except Exception as e:
+        print(f"❌ CRITICAL: Could not fetch from Supabase: {e}")
+        return -1
+    
+    # STEP 2: Validate sufficient stock in Supabase
+    if supabase_stock < quantity:
+        print(f"❌ Insufficient stock in Supabase: requested {quantity}, available {supabase_stock}")
+        return -1
+    
+    # STEP 3: Initialize Redis with Supabase value if not already there
+    stock_key = get_stock_key(sku_normalized, location_for_redis)
+    
+    if redis_client:
+        try:
+            redis_current = redis_client.get(stock_key)
+            if not redis_current:
+                # Initialize Redis from Supabase value
+                redis_client.set(stock_key, supabase_stock)
+                print(f"✓ Redis initialized from Supabase: {stock_key} = {supabase_stock}")
+        except Exception as e:
+            print(f"⚠ Could not initialize Redis: {e}")
+    
+    # STEP 4: Create hold in Redis using Lua script
     if redis_client and hold_stock_script:
         try:
-            result = hold_stock_script(args=[sku, quantity, location])
+            result = hold_stock_script(args=[sku_normalized, quantity, location_for_redis])
             remaining = int(result)
-            # If Supabase write enabled, attempt to decrement Supabase as well
-            try:
-                from db.repositories import inventory_repo
-                ok = inventory_repo.decrement_stock(sku, location, quantity)
-                if ok:
-                    print(f"✓ Supabase decremented for {sku} at {location} by {quantity}")
-                else:
-                    # Attempt to create/upsert row with remaining value when decrement failed
-                    try:
-                        up_ok = inventory_repo.upsert_stock(sku, location, remaining)
-                        if up_ok:
-                            print(f"✓ Supabase upserted row for {sku} at {location} with quantity={remaining}")
-                        else:
-                            print(f"⚠ Supabase decrement skipped and upsert failed for {sku} at {location}")
-                    except Exception as e2:
-                        print(f"⚠ Exception while upserting Supabase stock for {sku} at {location}: {e2}")
-            except Exception as e:
-                print(f"⚠ Failed to update Supabase stock after hold: {e}")
-            return remaining
+            if remaining >= 0:
+                print(f"✓ Redis hold created: {sku_normalized} at {location_for_redis}, remaining in Redis={remaining}")
+                return remaining
+            else:
+                print(f"❌ Hold failed in Redis: {sku_normalized} at {location_for_redis} (no stock left in Redis)")
+                return -1
         except Exception as e:
-            print(f"Error holding stock: {e}")
+            print(f"❌ Error creating hold in Redis: {e}")
             return -1
-
-    loc = location if location == "online" else f"store:{location}"
-    stock_key = get_stock_key(sku, location)
+    
+    # FALLBACK: In-memory storage if Redis unavailable
     with _LOCK:
-        current = int(_IN_MEMORY_STOCK.get(stock_key, 0))
+        current = int(_IN_MEMORY_STOCK.get(stock_key, supabase_stock))
         if current >= quantity:
             _IN_MEMORY_STOCK[stock_key] = current - quantity
+            print(f"✓ In-memory hold created: {sku_normalized} at {location_for_redis}, remaining={current - quantity}")
             return current - quantity
+        print(f"❌ Insufficient stock in memory fallback")
         return -1
 
 
@@ -245,14 +342,17 @@ def release_stock_atomic(sku: str, quantity: int, location: str = "online") -> i
     Returns:
         New stock level
     """
+    # Normalize SKU (trim and uppercase for consistency)
+    sku_normalized = sku.strip().upper()
+    
     if redis_client and release_stock_script:
         try:
-            result = release_stock_script(args=[sku, quantity, location])
+            result = release_stock_script(args=[sku_normalized, quantity, location])
             new_stock = int(result)
             # If Supabase write enabled, attempt to increment Supabase as well
             try:
                 from db.repositories import inventory_repo
-                inventory_repo.increment_stock(sku, location, quantity)
+                inventory_repo.increment_stock(sku_normalized, location, quantity)
             except Exception as e:
                 print(f"⚠ Failed to update Supabase stock after release: {e}")
             return new_stock
@@ -260,7 +360,7 @@ def release_stock_atomic(sku: str, quantity: int, location: str = "online") -> i
             print(f"Error releasing stock: {e}")
             return 0
 
-    stock_key = get_stock_key(sku, location)
+    stock_key = get_stock_key(sku_normalized, location)
     with _LOCK:
         current = int(_IN_MEMORY_STOCK.get(stock_key, 0))
         new_value = current + quantity

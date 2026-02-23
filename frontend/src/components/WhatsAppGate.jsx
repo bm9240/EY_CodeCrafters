@@ -21,9 +21,6 @@ const WhatsAppGate = () => {
     }
 
     const previousPhone = sessionStore.getPhone() || '';
-    if (previousPhone) {
-      sessionStore.clearPhone();
-    }
     setPhoneInput(previousPhone);
     setIsChecking(false);
   }, [navigate]);
@@ -41,7 +38,11 @@ const WhatsAppGate = () => {
       return;
     }
 
-    sessionStore.clearSessionToken();
+    const existingPhone = sessionStore.getPhone();
+    const existingToken = sessionStore.getSessionToken();
+    if (!existingToken || existingPhone !== digits) {
+      sessionStore.clearSessionToken();
+    }
     sessionStore.setPhone(digits);
     setChatKey(`chat-${digits}-${Date.now()}`);
     setIsReady(true);

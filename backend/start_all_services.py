@@ -22,12 +22,12 @@ SERVICES = [
     ("Fulfillment", "agents/worker_agents/fulfillment", 8004),
     ("Post-Purchase", "agents/worker_agents/post_purchase", 8005),
     ("Stylist", "agents/worker_agents/stylist", 8006),
-    ("Virtual Circles", "agents/worker_agents/virtual_circles", 8009),
-    ("Recommendation", "agents/worker_agents/recommendation", 8008),
-    ("Ambient Commerce", "agents/worker_agents/ambient_commerce", 8017),
     ("Data API", "data_api.py", 8007),
+    ("Virtual Circles", "agents/worker_agents/virtual_circles", 8009),
     ("Sales Agent", "agents/sales_agent", 8010),
     ("Telegram", "agents/worker_agents/telegram", 8011),
+    ("Reservation", "agents/worker_agents/reservation", 8012),
+    ("Ambient Commerce", "agents/worker_agents/ambient_commerce", 8017),
 ]
 
 def start_service(name, path, port, env_vars=None):

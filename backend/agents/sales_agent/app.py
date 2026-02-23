@@ -15,7 +15,7 @@ from typing import Optional, Dict, Any, List
 from datetime import datetime
 from pathlib import Path
 
-from fastapi import FastAPI, Request, status, UploadFile, File
+from fastapi import FastAPI, Request, status, UploadFile, File, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
 import requests
@@ -24,9 +24,19 @@ from fastapi.exceptions import RequestValidationError
 from pydantic import BaseModel, Field
 import uvicorn
 from dotenv import load_dotenv
+import redis
+import sys
 
 # Load environment variables from .env file
 load_dotenv(Path(__file__).parent / '.env')
+
+# Add backend to path for Supabase client
+backend_path = Path(__file__).resolve().parent.parent.parent
+if str(backend_path) not in sys.path:
+    sys.path.insert(0, str(backend_path))
+
+# Import Supabase client
+from db import supabase_client
 
 # Import LangGraph Sales Agent (absolute import for direct uvicorn execution)
 from sales_graph import process_message as process_with_langgraph
@@ -37,6 +47,18 @@ logging.basicConfig(
     format="%(asctime)s - %(name)s - %(levelname)s - %(message)s"
 )
 logger = logging.getLogger(__name__)
+
+# Initialize Redis client for reservation locks (after logger is configured)
+redis_client = None
+REDIS_URL = os.getenv("REDIS_URL")
+if REDIS_URL:
+    try:
+        redis_client = redis.from_url(REDIS_URL, decode_responses=True, socket_connect_timeout=5)
+        redis_client.ping()
+        logger.info("✓ Redis connected for reservation locks")
+    except Exception as e:
+        logger.warning(f"⚠ Redis connection failed: {e} - reservations will fail")
+        redis_client = None
 
 PAYMENT_SERVICE_URL = os.getenv("PAYMENT_URL", "http://localhost:8003")
 
@@ -646,6 +668,8 @@ async def handle_post_payment(request: PostPaymentRequest):
     3. Trigger stylist analysis
     4. Update inventory
 
+    Note: Payment success message is generated and sent by the Payment Agent separately
+
     Args:
         request: PostPaymentRequest with verified payment details
 
@@ -1053,6 +1077,663 @@ Generate ONLY the welcome message (no extra text):"""
             },
             cards=[]
         )
+
+
+# ============================================================================
+# INVENTORY & STORE PROXIES (through Sales Agent)
+# ============================================================================
+
+@app.get("/api/stores")
+async def list_stores():
+    """
+    Proxy endpoint to fetch all stores from Supabase via inventory service.
+    All store queries go through the sales agent for proper orchestration.
+    """
+    try:
+        logger.info("🏬 Fetching all stores via inventory service")
+        
+        # Call inventory service
+        response = requests.get(
+            "http://localhost:8001/stores",
+            timeout=5
+        )
+        response.raise_for_status()
+        
+        stores_data = response.json()
+        logger.info(f"✅ Fetched {len(stores_data.get('stores', []))} stores")
+        
+        return stores_data
+        
+    except Exception as e:
+        logger.error(f"❌ Failed to fetch stores: {e}")
+        raise HTTPException(status_code=500, detail=f"Failed to fetch stores: {str(e)}")
+
+
+@app.get("/api/stores/{store_location}/inventory/{sku}")
+async def check_store_inventory(store_location: str, sku: str):
+    """
+    Proxy endpoint to check inventory for a product at a specific store.
+    Fetches current stock from Supabase inventory table via inventory service.
+    
+    Args:
+        store_location: Store location ID (e.g., 'STORE_MUMBAI')
+        sku: Product SKU
+        
+    Returns:
+        Inventory details including available stock and can_reserve status
+    """
+    try:
+        logger.info(f"📦 Checking inventory: SKU={sku} at {store_location}")
+        
+        # Call inventory service
+        response = requests.get(
+            f"http://localhost:8001/stores/{store_location}/inventory/{sku}",
+            timeout=5
+        )
+        response.raise_for_status()
+        
+        inventory_data = response.json()
+        logger.info(f"✅ Inventory check: {inventory_data['available_stock']} units available")
+        
+        return inventory_data
+        
+    except Exception as e:
+        logger.error(f"❌ Failed to check inventory: {e}")
+        raise HTTPException(status_code=500, detail=f"Failed to check inventory: {str(e)}")
+
+
+class ReserveInStoreRequest(BaseModel):
+    """Request to reserve product in store."""
+    customer_id: str
+    sku: str
+    quantity: int = Field(..., gt=0)
+    store_location: str
+    session_token: Optional[str] = None
+
+
+@app.post("/api/reserve-in-store")
+async def reserve_in_store(request: ReserveInStoreRequest):
+    """
+    Reserve a product in a specific store.
+    
+    EXECUTION ORDER (MUST NOT CHANGE):
+    1. Validate request payload
+    2. Fetch inventory from Supabase (source of truth)
+    3. Check Redis reservation lock
+    4. Create reservation in Supabase
+    5. Create Redis lock
+    6. Return success
+    
+    Args:
+        request: ReserveInStoreRequest with customer, SKU, quantity, and store
+        
+    Returns:
+        Reservation confirmation with reservation_id and expiry
+    """
+    try:
+        logger.info(
+            f"🏪 [RESERVE-IN-STORE] customer={request.customer_id}, "
+            f"sku={request.sku}, qty={request.quantity}, store={request.store_location}"
+        )
+        
+        # ====================================================================
+        # STEP 1: VALIDATE REQUEST PAYLOAD
+        # ====================================================================
+        if not request.sku or not request.store_location:
+            logger.error(f"❌ Missing required fields: sku={request.sku}, store={request.store_location}")
+            return JSONResponse(
+                status_code=400,
+                content={
+                    "status": "validation_error",
+                    "message": "sku and store_location are required"
+                }
+            )
+        
+        # Normalize inputs
+        sku_normalized = request.sku.strip().upper()
+        store_normalized = request.store_location.strip().upper()
+        
+        logger.info(f"📋 Normalized: sku={sku_normalized}, store={store_normalized}")
+        
+        # ====================================================================
+        # STEP 2: FETCH INVENTORY FROM SUPABASE (SOURCE OF TRUTH)
+        # ====================================================================
+        logger.info(f"📊 [STEP 2] Querying Supabase for store-level inventory...")
+        
+        try:
+            # Query Supabase inventory table directly
+            inventory_rows = supabase_client.select(
+                'inventory',
+                params=f"sku=eq.{sku_normalized}&store_id=eq.{store_normalized}",
+                columns="sku,store_id,quantity"
+            )
+            
+            if not inventory_rows or len(inventory_rows) == 0:
+                logger.warning(f"⚠️ No inventory record found in Supabase for sku={sku_normalized}, store={store_normalized}")
+                db_stock = 0
+            else:
+                db_stock = int(inventory_rows[0].get('quantity', 0))
+                logger.info(f"✅ Supabase inventory: {db_stock} units")
+            
+        except Exception as e:
+            logger.error(f"❌ Supabase query failed: {e}")
+            return JSONResponse(
+                status_code=503,
+                content={
+                    "status": "database_unavailable",
+                    "message": "Failed to check inventory database"
+                }
+            )
+        
+        # Check if sufficient stock exists in Supabase
+        if db_stock <= 0:
+            logger.warning(
+                f"🚫 [RETURN 409] Insufficient stock in Supabase\n"
+                f"   sku={sku_normalized}\n"
+                f"   store={store_normalized}\n"
+                f"   dbStock={db_stock}\n"
+                f"   requested={request.quantity}"
+            )
+            return JSONResponse(
+                status_code=409,
+                content={
+                    "status": "insufficient_stock",
+                    "sku": sku_normalized,
+                    "store": store_normalized,
+                    "available": db_stock,
+                    "requested": request.quantity,
+                    "reason": "Supabase inventory quantity <= 0"
+                }
+            )
+        
+        if db_stock < request.quantity:
+            logger.warning(
+                f"🚫 [RETURN 409] Insufficient stock for requested quantity\n"
+                f"   sku={sku_normalized}\n"
+                f"   store={store_normalized}\n"
+                f"   dbStock={db_stock}\n"
+                f"   requested={request.quantity}"
+            )
+            return JSONResponse(
+                status_code=409,
+                content={
+                    "status": "insufficient_stock",
+                    "sku": sku_normalized,
+                    "store": store_normalized,
+                    "available": db_stock,
+                    "requested": request.quantity,
+                    "reason": f"Available: {db_stock}, Requested: {request.quantity}"
+                }
+            )
+        
+        # ====================================================================
+        # STEP 3: CHECK REDIS RESERVATION LOCK
+        # ====================================================================
+        logger.info(f"🔐 [STEP 3] Checking Redis reservation lock...")
+        
+        if not redis_client:
+            logger.error("❌ Redis not available - cannot create reservation locks")
+            return JSONResponse(
+                status_code=503,
+                content={
+                    "status": "redis_unavailable",
+                    "message": "Reservation locking service unavailable"
+                }
+            )
+        
+        # Redis key format: reserve:{storeId}:{sku}
+        reservation_lock_key = f"reserve:{store_normalized}:{sku_normalized}"
+        
+        try:
+            redis_lock_exists = redis_client.exists(reservation_lock_key)
+            
+            if redis_lock_exists:
+                logger.warning(
+                    f"🚫 [RETURN 409] Redis reservation lock exists\n"
+                    f"   sku={sku_normalized}\n"
+                    f"   store={store_normalized}\n"
+                    f"   dbStock={db_stock}\n"
+                    f"   redisLockKey={reservation_lock_key}\n"
+                    f"   redisLockExists=True"
+                )
+                return JSONResponse(
+                    status_code=409,
+                    content={
+                        "status": "already_reserved",
+                        "sku": sku_normalized,
+                        "store": store_normalized,
+                        "message": "This item is already reserved at this store",
+                        "reason": "Redis reservation lock exists"
+                    }
+                )
+            
+            logger.info(f"✅ No reservation lock found - proceeding with reservation")
+            
+        except Exception as e:
+            logger.error(f"❌ Redis lock check failed: {e}")
+            return JSONResponse(
+                status_code=503,
+                content={
+                    "status": "redis_error",
+                    "message": "Failed to check reservation lock"
+                }
+            )
+        
+        # ====================================================================
+        # STEP 4: CREATE RESERVATION IN SUPABASE
+        # ====================================================================
+        logger.info(f"💾 [STEP 4] Creating reservation in Supabase...")
+        
+        try:
+            reservation_response = requests.post(
+                "http://localhost:8012/reservations",
+                json={
+                    "customer_id": request.customer_id,
+                    "sku": sku_normalized,
+                    "quantity": request.quantity,
+                    "store_location": store_normalized,
+                    "hold_id": f"reserve-{uuid.uuid4()}"
+                },
+                timeout=5
+            )
+            
+            if reservation_response.status_code != 200:
+                logger.error(f"❌ Reservation service failed: {reservation_response.status_code}")
+                return JSONResponse(
+                    status_code=500,
+                    content={
+                        "status": "reservation_failed",
+                        "message": "Failed to create reservation record"
+                    }
+                )
+            
+            reservation_data = reservation_response.json()
+            reservation_id = reservation_data.get('reservation_id')
+            expires_at = reservation_data.get('expires_at')
+            
+            logger.info(f"✅ Reservation created: {reservation_id}")
+            
+        except Exception as e:
+            logger.error(f"❌ Failed to create reservation: {e}")
+            return JSONResponse(
+                status_code=500,
+                content={
+                    "status": "reservation_error",
+                    "message": str(e)
+                }
+            )
+        
+        # ====================================================================
+        # STEP 5: CREATE REDIS LOCK
+        # ====================================================================
+        logger.info(f"🔒 [STEP 5] Creating Redis reservation lock...")
+        
+        try:
+            # TTL = 24 hours (matching reservation expiry)
+            ttl_seconds = 24 * 60 * 60
+            redis_client.setex(reservation_lock_key, ttl_seconds, reservation_id)
+            logger.info(f"✅ Redis lock created: {reservation_lock_key} (TTL={ttl_seconds}s)")
+            
+        except Exception as e:
+            logger.warning(f"⚠️ Redis lock creation failed (reservation still valid): {e}")
+        
+        # ====================================================================
+        # STEP 6: RETURN SUCCESS
+        # ====================================================================
+        logger.info(f"✅ [SUCCESS] Reservation complete: {reservation_id}")
+        
+        return {
+            "status": "reserved",
+            "reservation_id": reservation_id,
+            "sku": sku_normalized,
+            "quantity": request.quantity,
+            "store_location": store_normalized,
+            "expires_at": expires_at,
+            "timestamp": datetime.utcnow().isoformat()
+        }
+        
+    except Exception as e:
+        logger.error(f"❌ Unexpected error in reserve_in_store: {e}", exc_info=True)
+        return JSONResponse(
+            status_code=500,
+            content={
+                "status": "error",
+                "error": str(e),
+                "message": "Failed to create reservation"
+            }
+        )
+
+
+@app.post("/api/hold/{hold_id}/release")
+async def release_hold(hold_id: str):
+    """
+    Release a reserved hold through the inventory service.
+    
+    Args:
+        hold_id: The ID of the hold to release
+        
+    Returns:
+        Release confirmation
+    """
+    try:
+        logger.info(f"🔓 Releasing hold: {hold_id}")
+        
+        # Release through inventory service (uses POST /release)
+        response = requests.post(
+            "http://localhost:8001/release",
+            json={"hold_id": hold_id},
+            timeout=5
+        ).json()
+        
+        logger.info(f"✅ Hold released: {hold_id}")
+        return {
+            "status": "released",
+            "hold_id": hold_id,
+            "timestamp": datetime.utcnow().isoformat()
+        }
+    except Exception as e:
+        logger.error(f"❌ Failed to release hold {hold_id}: {e}")
+        return JSONResponse(
+            status_code=500,
+            content={
+                "status": "error",
+                "error": str(e),
+                "message": "Failed to release hold"
+            }
+        )
+
+
+# ============================================================================
+# ADMIN RESERVATION ENDPOINTS (through Sales Agent)
+# ============================================================================
+
+@app.get("/api/admin/reservations")
+async def list_admin_reservations(store: str = None):
+    """
+    List all reservations for a store (admin view).
+    
+    Args:
+        store: Store location ID (e.g., 'STORE_MUMBAI')
+        
+    Returns:
+        List of reservations for the store
+    """
+    try:
+        if not store:
+            raise HTTPException(status_code=400, detail="Store parameter required")
+        
+        logger.info(f"📋 Admin: Listing reservations for store={store}")
+        
+        # Call reservation service to get store reservations
+        url = f"http://localhost:8012/admin/reservations?store={store}"
+        logger.debug(f"🔗 Calling Reservation Service: {url}")
+        
+        response = requests.get(url, timeout=5)
+        
+        logger.debug(f"🔗 Reservation Service response status: {response.status_code}")
+        if response.status_code != 200:
+            logger.error(f"❌ Reservation Service returned {response.status_code}: {response.text}")
+            response.raise_for_status()
+        
+        reservations = response.json()
+        logger.debug(f"📖 Response body: {reservations}")
+        logger.info(f"✅ Fetched {len(reservations.get('reservations', []))} admin reservations for {store}")
+        
+        return reservations
+        
+    except requests.exceptions.RequestException as e:
+        logger.error(f"❌ Request error calling Reservation Service: {e}", exc_info=True)
+        raise HTTPException(status_code=502, detail=f"Reservation Service error: {str(e)}")
+    except Exception as e:
+        logger.error(f"❌ Failed to list admin reservations: {e}", exc_info=True)
+        raise HTTPException(status_code=500, detail=f"Failed to fetch reservations: {str(e)}")
+
+
+@app.put("/api/admin/reservations/{reservation_id}/confirm")
+async def confirm_admin_reservation(reservation_id: str, store: str = None):
+    """
+    Confirm a reservation (mark item as kept aside).
+    
+    Args:
+        reservation_id: Reservation ID to confirm
+        store: Store location ID for verification
+        
+    Returns:
+        Confirmation result
+    """
+    try:
+        if not store:
+            raise HTTPException(status_code=400, detail="Store parameter required")
+        
+        logger.info(f"✅ Admin: Confirming reservation {reservation_id} at {store}")
+        
+        # Call reservation service to confirm
+        response = requests.put(
+            f"http://localhost:8012/admin/reservations/{reservation_id}/confirm?store={store}",
+            timeout=5
+        )
+        response.raise_for_status()
+        
+        result = response.json()
+        logger.info(f"✅ Reservation confirmed: {reservation_id}")
+        
+        return result
+        
+    except Exception as e:
+        logger.error(f"❌ Failed to confirm reservation: {e}")
+        raise HTTPException(status_code=500, detail=f"Failed to confirm reservation: {str(e)}")
+
+
+@app.put("/api/admin/reservations/{reservation_id}/convert")
+async def convert_admin_reservation(reservation_id: str, store: str = None, order_id: str = None):
+    """
+    Convert a reservation to a purchase.
+    
+    Args:
+        reservation_id: Reservation ID to convert
+        store: Store location ID for verification
+        order_id: Optional order ID if converting to an existing order
+        
+    Returns:
+        Conversion result
+    """
+    try:
+        if not store:
+            raise HTTPException(status_code=400, detail="Store parameter required")
+        
+        logger.info(f"🔄 Admin: Converting reservation {reservation_id} to sale at {store}")
+        
+        # Call reservation service to convert
+        url = f"http://localhost:8012/admin/reservations/{reservation_id}/convert?store={store}"
+        if order_id:
+            url += f"&order_id={order_id}"
+        
+        response = requests.put(url, timeout=5)
+        response.raise_for_status()
+        
+        result = response.json()
+        logger.info(f"✅ Reservation converted to sale: {reservation_id}")
+        
+        return result
+        
+    except Exception as e:
+        logger.error(f"❌ Failed to convert reservation: {e}")
+        raise HTTPException(status_code=500, detail=f"Failed to convert reservation: {str(e)}")
+
+
+# ============================================================================
+# CUSTOMER RESERVATION ENDPOINTS (through Sales Agent)
+# ============================================================================
+
+class ReservationCreateRequest(BaseModel):
+    """Request to create a reservation."""
+    customer_id: str
+    sku: str
+    quantity: int = 1
+    store_location: str
+    hold_id: str
+
+
+@app.post("/api/reservations")
+async def create_customer_reservation(request: ReservationCreateRequest):
+    """
+    Create a new reservation (customer).
+    
+    Args:
+        request: Reservation creation details
+        
+    Returns:
+        Reservation confirmation
+    """
+    try:
+        logger.info(f"📝 Customer: Creating reservation for {request.customer_id}, SKU={request.sku}")
+        
+        response = requests.post(
+            "http://localhost:8012/reservations",
+            json=request.dict(),
+            timeout=5
+        )
+        response.raise_for_status()
+        
+        result = response.json()
+        logger.info(f"✅ Reservation created: {result.get('reservation_id')}")
+        
+        return result
+        
+    except Exception as e:
+        logger.error(f"❌ Failed to create reservation: {e}")
+        raise HTTPException(status_code=500, detail=f"Failed to create reservation: {str(e)}")
+
+
+@app.get("/api/reservations")
+async def list_customer_reservations(customer_id: str = None):
+    """
+    List all reservations for a customer.
+    
+    Args:
+        customer_id: Customer ID to fetch reservations for
+        
+    Returns:
+        List of customer's reservations
+    """
+    try:
+        if not customer_id:
+            raise HTTPException(status_code=400, detail="customer_id parameter required")
+        
+        logger.info(f"📋 Listing reservations for customer={customer_id}")
+        
+        response = requests.get(
+            f"http://localhost:8012/reservations?customer_id={customer_id}",
+            timeout=5
+        )
+        response.raise_for_status()
+        
+        reservations = response.json()
+        logger.info(f"✅ Fetched {len(reservations.get('reservations', []))} reservations for {customer_id}")
+        
+        return reservations
+        
+    except Exception as e:
+        logger.error(f"❌ Failed to list customer reservations: {e}")
+        raise HTTPException(status_code=500, detail=f"Failed to fetch reservations: {str(e)}")
+
+
+@app.get("/api/reservations/{reservation_id}")
+async def get_customer_reservation(reservation_id: str):
+    """
+    Get a specific reservation by ID.
+    
+    Args:
+        reservation_id: Reservation ID to fetch
+        
+    Returns:
+        Reservation details
+    """
+    try:
+        logger.info(f"📖 Fetching reservation: {reservation_id}")
+        
+        response = requests.get(
+            f"http://localhost:8012/reservations/{reservation_id}",
+            timeout=5
+        )
+        response.raise_for_status()
+        
+        reservation = response.json()
+        logger.info(f"✅ Retrieved reservation: {reservation_id}")
+        
+        return reservation
+        
+    except Exception as e:
+        logger.error(f"❌ Failed to fetch reservation: {e}")
+        raise HTTPException(status_code=500, detail=f"Failed to fetch reservation: {str(e)}")
+
+
+class ReservationStatusRequest(BaseModel):
+    """Request to update reservation status."""
+    status: str
+    notes: str = None
+
+
+@app.put("/api/reservations/{reservation_id}/status")
+async def update_customer_reservation_status(reservation_id: str, request: ReservationStatusRequest):
+    """
+    Update a reservation's status.
+    
+    Args:
+        reservation_id: Reservation ID to update
+        request: New status and optional notes
+        
+    Returns:
+        Updated reservation
+    """
+    try:
+        logger.info(f"🔄 Updating reservation {reservation_id} status to {request.status}")
+        
+        response = requests.put(
+            f"http://localhost:8012/reservations/{reservation_id}/status",
+            json=request.dict(),
+            timeout=5
+        )
+        response.raise_for_status()
+        
+        result = response.json()
+        logger.info(f"✅ Reservation status updated: {reservation_id}")
+        
+        return result
+        
+    except Exception as e:
+        logger.error(f"❌ Failed to update reservation status: {e}")
+        raise HTTPException(status_code=500, detail=f"Failed to update reservation: {str(e)}")
+
+
+@app.delete("/api/reservations/{reservation_id}")
+async def cancel_customer_reservation(reservation_id: str):
+    """
+    Cancel a reservation.
+    
+    Args:
+        reservation_id: Reservation ID to cancel
+        
+    Returns:
+        Cancellation confirmation
+    """
+    try:
+        logger.info(f"❌ Cancelling reservation: {reservation_id}")
+        
+        response = requests.delete(
+            f"http://localhost:8012/reservations/{reservation_id}",
+            timeout=5
+        )
+        response.raise_for_status()
+        
+        result = response.json()
+        logger.info(f"✅ Reservation cancelled: {reservation_id}")
+        
+        return result
+        
+    except Exception as e:
+        logger.error(f"❌ Failed to cancel reservation: {e}")
+        raise HTTPException(status_code=500, detail=f"Failed to cancel reservation: {str(e)}")
 
 
 # ============================================================================

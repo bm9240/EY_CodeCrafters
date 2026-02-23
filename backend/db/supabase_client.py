@@ -128,6 +128,49 @@ def select_one(
     return rows[0] if rows else None
 
 
+def insert(
+    table: str,
+    rows: Union[Dict[str, Any], Sequence[Dict[str, Any]]],
+    timeout: int = 10,
+) -> Optional[List[Dict[str, Any]]]:
+    """Insert row(s) into a Supabase table."""
+    if not is_write_enabled():
+        logger.debug("[supabase_client] Insert skipped; feature disabled")
+        return None
+
+    payload: List[Dict[str, Any]]
+    if isinstance(rows, dict):
+        payload = [rows]
+    else:
+        payload = list(rows)
+
+    if not payload:
+        return None
+
+    url = _build_url(table)
+    headers = _get_headers(
+        _get_write_key(),
+        extra={"Prefer": "return=representation"},
+    )
+
+    try:
+        resp = requests.post(url, headers=headers, json=payload, timeout=timeout)
+        resp.raise_for_status()
+        if resp.content:
+            return resp.json()
+        return None
+    except requests.exceptions.HTTPError as exc:
+        status = getattr(exc.response, "status_code", "N/A")
+        body = getattr(exc.response, "text", str(exc))[:400]
+        logger.warning(
+            "[supabase_client] Insert failed for %s (%s): %s", table, status, body
+        )
+        raise
+    except requests.exceptions.RequestException as exc:
+        logger.warning("[supabase_client] Insert request error for %s: %s", table, exc)
+        raise
+
+
 def upsert(
     table: str,
     rows: Union[Dict[str, Any], Sequence[Dict[str, Any]]],

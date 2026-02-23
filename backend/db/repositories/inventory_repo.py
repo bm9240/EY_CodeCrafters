@@ -46,17 +46,19 @@ def get_stock(sku: str) -> Optional[Dict[str, Any]]:
     if not is_enabled():
         return None
     
+    # Normalize SKU: trim and uppercase (matches how SKUs are stored)
+    sku_normalized = sku.strip().upper()
     try:
-        # Quote string values in PostgREST filter params to avoid 400 Bad Request
-        rows = select("inventory", params=f"sku=eq.'{sku}'", columns="sku,store_id,quantity")
+        # Query Supabase for normalized SKU
+        rows = select("inventory", params=f"sku=eq.'{sku_normalized}'", columns="sku,store_id,quantity")
         if not rows:
-            print(f"[inventory_repo] No rows for SKU={sku}")
+            print(f"[inventory_repo] No rows for SKU={sku_normalized}")
             return None
         result = _aggregate_rows(rows)
-        print(f"[inventory_repo] Supabase returned {len(rows)} rows for SKU={sku}, total={result['total']}")
+        print(f"[inventory_repo] Supabase returned {len(rows)} rows for SKU={sku_normalized}, stores={result['stores']}")
         return result
     except Exception as e:
-        print(f"[inventory_repo] Error querying SKU={sku}: {e}")
+        print(f"[inventory_repo] Error querying SKU={sku_normalized}: {e}")
         return None
 
 
@@ -93,6 +95,8 @@ def decrement_stock(sku: str, location: str, amount: int) -> bool:
             # Write not enabled; skip
             return False
 
+        # Normalize SKU
+        sku = sku.strip().upper()
         store_id = _normalize_store_id(location)
         # Find existing row quantity (don't assume an 'id' column exists)
         row = select_one("inventory", params=f"sku=eq.'{sku}'&store_id=eq.'{store_id}'", columns="quantity")
@@ -152,14 +156,17 @@ def upsert_stock(sku: str, location: str, quantity: int) -> bool:
             return False
 
         store_id = _normalize_store_id(location)
+        
+        # Payload without inventory_id - let Supabase auto-generate if needed
+        # Focus on the composite key: sku + store_id
         payload = {
             "sku": sku,
             "store_id": store_id,
             "quantity": int(quantity)
         }
 
-        # Use upsert without explicit on_conflict to create the row when missing.
-        upsert("inventory", payload)
+        # Upsert on sku+store_id composite key
+        upsert("inventory", payload, conflict_column="sku,store_id")
         return True
     except Exception as e:
         print(f"[inventory_repo] Failed to upsert stock for {sku} at {location}: {e}")

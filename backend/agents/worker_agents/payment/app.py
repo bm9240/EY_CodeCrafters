@@ -31,6 +31,7 @@ sys.path.insert(0, str(Path(__file__).parent.parent.parent.parent))
 import orders_repository
 from db import supabase_client
 
+
 # Load environment variables
 load_dotenv(Path(__file__).parent.parent.parent.parent / ".env")
 
@@ -39,6 +40,7 @@ app = FastAPI(
     description="Payment processing and transaction management system",
     version="1.0.0"
 )
+
 
 # CORS configuration
 app.add_middleware(
@@ -1347,6 +1349,7 @@ async def verify_razorpay_payment(payload: RazorpayVerifyRequest):
 
 
 app.include_router(razorpay_router)
+
 
 
 @app.post("/payment/process", response_model=PaymentResponse)
