@@ -33,6 +33,31 @@ redis_client = redis.Redis(
     socket_timeout=5
 )
 
+# Supabase fallback for persistent storage
+supabase_enabled = False
+try:
+    import sys
+    from pathlib import Path
+    from dotenv import load_dotenv
+    
+    # Load .env from backend directory
+    backend_path = Path(__file__).resolve().parent.parent.parent.parent
+    env_path = backend_path / ".env"
+    load_dotenv(env_path)
+    
+    if str(backend_path) not in sys.path:
+        sys.path.insert(0, str(backend_path))
+    from db import supabase_client
+    supabase_enabled = supabase_client.is_enabled()
+    if supabase_enabled:
+        print("✅ Supabase fallback enabled for Virtual Circles chat persistence")
+    else:
+        print("⚠️ Supabase fallback disabled - check FEATURE_SUPABASE_READ/WRITE and credentials")
+except ImportError as e:
+    print(f"⚠️ Supabase import failed: {e}")
+except Exception as e:
+    print(f"⚠️ Supabase initialization failed: {e}")
+
 # Key patterns
 CIRCLE_CHAT_KEY = "vc:circle:{circle_id}:messages"  # List of message JSON
 USER_TIMESTAMPS_KEY = "vc:user:{user_id}:timestamps"  # List of timestamps
@@ -40,8 +65,77 @@ AI_INSIGHT_TIMER_KEY = "vc:circle:{circle_id}:ai_last_insight"  # Timestamp stri
 USER_ALIAS_KEY = "vc:alias:{user_id}:{circle_id}"  # String alias
 
 
+# Supabase fallback functions for persistent chat storage
+def _store_message_supabase(circle_id: str, message: Dict) -> bool:
+    """Store a chat message in Supabase as fallback"""
+    if not supabase_enabled:
+        return False
+    
+    try:
+        # Prepare message for Supabase
+        message_data = {
+            "circle_id": circle_id,
+            "user_id": message.get("user_id", ""),
+            "alias": message.get("alias", ""),
+            "text": message.get("text", ""),
+            "timestamp": message.get("timestamp", datetime.now().isoformat()),
+            "type": message.get("type", "user"),
+            "message_id": message.get("message_id", "")
+        }
+        
+        # Insert into chat_messages table
+        result = supabase_client.insert("chat_messages", [message_data])
+        if result:
+            print(f"✅ Message stored in Supabase fallback for circle {circle_id}")
+            return True
+        return False
+    except Exception as e:
+        print(f"❌ Supabase store_message error: {e}")
+        return False
+
+
+def _get_messages_supabase(circle_id: str, limit: int = 50) -> List[Dict]:
+    """Get recent messages from Supabase as fallback"""
+    if not supabase_enabled:
+        return []
+    
+    try:
+        # Query chat_messages table
+        messages = supabase_client.select(
+            "chat_messages", 
+            params=f"circle_id=eq.{circle_id}",
+            columns="circle_id,user_id,alias,text,timestamp,type,message_id",
+            timeout=10
+        )
+        
+        if not messages:
+            return []
+        
+        # Sort by timestamp in chronological order (oldest first, newest last)
+        sorted_messages = sorted(messages, key=lambda x: x.get('timestamp', ''))
+        # Return the most recent messages (last 'limit' messages)
+        return sorted_messages[-limit:] if len(sorted_messages) > limit else sorted_messages
+    except Exception as e:
+        print(f"❌ Supabase get_messages error: {e}")
+        return []
+
+
+def _get_message_count_supabase(circle_id: str) -> int:
+    """Get total message count from Supabase"""
+    if not supabase_enabled:
+        return 0
+    
+    try:
+        # This is a simplified count - in production you'd want a more efficient query
+        messages = supabase_client.select("chat_messages", params=f"circle_id=eq.{circle_id}", columns="id")
+        return len(messages) if messages else 0
+    except Exception as e:
+        print(f"❌ Supabase get_message_count error: {e}")
+        return 0
+
+
 def store_message(circle_id: str, message: Dict) -> bool:
-    """Store a chat message in Redis"""
+    """Store a chat message in Redis with Supabase fallback"""
     try:
         key = CIRCLE_CHAT_KEY.format(circle_id=circle_id)
         redis_client.rpush(key, json.dumps(message))
@@ -52,11 +146,13 @@ def store_message(circle_id: str, message: Dict) -> bool:
         return True
     except Exception as e:
         print(f"❌ Redis store_message error: {e}")
-        return False
+        # Fallback to Supabase
+        print("🔄 Falling back to Supabase for message storage...")
+        return _store_message_supabase(circle_id, message)
 
 
 def get_messages(circle_id: str, limit: int = 50) -> List[Dict]:
-    """Get recent messages from Redis"""
+    """Get recent messages from Redis with Supabase fallback"""
     try:
         key = CIRCLE_CHAT_KEY.format(circle_id=circle_id)
         messages_json = redis_client.lrange(key, -limit, -1)
@@ -71,17 +167,21 @@ def get_messages(circle_id: str, limit: int = 50) -> List[Dict]:
         return messages
     except Exception as e:
         print(f"❌ Redis get_messages error: {e}")
-        return []
+        # Fallback to Supabase
+        print("🔄 Falling back to Supabase for message retrieval...")
+        return _get_messages_supabase(circle_id, limit)
 
 
 def get_message_count(circle_id: str) -> int:
-    """Get total message count for a circle"""
+    """Get total message count for a circle with Supabase fallback"""
     try:
         key = CIRCLE_CHAT_KEY.format(circle_id=circle_id)
         return redis_client.llen(key)
     except Exception as e:
         print(f"❌ Redis get_message_count error: {e}")
-        return 0
+        # Fallback to Supabase
+        print("🔄 Falling back to Supabase for message count...")
+        return _get_message_count_supabase(circle_id)
 
 
 def add_user_timestamp(user_id: str, timestamp: str):
