@@ -63,7 +63,7 @@ class ConnectionManager:
         # Try to enrich with order details
         order_details = None
         try:
-            order = orders_repository.get_order_by_id(order_id)
+            order = orders_repository.get_order(order_id)
             if order:
                 order_details = {
                     "customer_id": order.get("customer_id"),
@@ -80,11 +80,15 @@ class ConnectionManager:
             "fulfillment": fulfillment_data,
             "order_details": order_details
         }
+        
+        current_status = fulfillment_data.get("current_status", "UNKNOWN")
+        logger.warning(f"📢 Broadcasting to {len(self.active_connections)} clients: Order {order_id} - Status: {current_status}")
+        
         disconnected = []
         for connection in self.active_connections:
             try:
                 await connection.send_json(message)
-                logger.info(f"📤 Sent delivery update for {order_id}")
+                logger.info(f"📤 Sent delivery update for {order_id} to client")
             except Exception as e:
                 logger.error(f"Error sending to WebSocket: {e}")
                 disconnected.append(connection)
@@ -323,48 +327,60 @@ def _schedule_next_progression(order_id: str):
                 
                 # Broadcast WebSocket event for OUT_FOR_DELIVERY and DELIVERED
                 if next_status in [FulfillmentStatus.OUT_FOR_DELIVERY, FulfillmentStatus.DELIVERED]:
+                    logger.warning(f"🔔 Broadcasting {next_status} status for order {order_id}")
                     try:
                         # Create event loop if needed and broadcast
                         loop = asyncio.new_event_loop()
                         asyncio.set_event_loop(loop)
                         loop.run_until_complete(manager.broadcast_delivery_update(order_id, fulfillment_dict))
                         loop.close()
-                        pass  # Broadcast sent (silent)
+                        logger.warning(f"✅ Successfully broadcasted {next_status} for order {order_id}")
                     except Exception as e:
-                        logger.error(f"Failed to broadcast WebSocket: {e}")
+                        logger.error(f"❌ Failed to broadcast WebSocket for {next_status}: {e}", exc_info=True)
                 
                 # Schedule next progression if not delivered
                 if next_status != FulfillmentStatus.DELIVERED:
-                    # For OUT_FOR_DELIVERY, schedule immediate progression to DELIVERED (no delay)
+                    # For OUT_FOR_DELIVERY, schedule delayed progression to DELIVERED (30 second realistic delay)
                     if next_status == FulfillmentStatus.OUT_FOR_DELIVERY:
-                        logger.info(f"🚀 Scheduling immediate progression for {order_id} from OUT_FOR_DELIVERY → DELIVERED")
-                        # Schedule with minimal delay (1 second) to ensure DELIVERED happens quickly
+                        logger.warning(f"🚀 Scheduling delayed progression for {order_id} from OUT_FOR_DELIVERY → DELIVERED (30 second delay)")
+                        # Schedule with 30-second delay to simulate realistic delivery time and give customer time to see OUT_FOR_DELIVERY message
                         job_id_delivered = f"progress_{order_id}_delivered_{uuid.uuid4()}"
                         scheduler.add_job(
                             progress_order,
                             'date',
-                            run_date=datetime.now() + timedelta(seconds=1),
+                            run_date=datetime.now() + timedelta(seconds=30),
                             id=job_id_delivered,
                             replace_existing=False
                         )
                     else:
                         _schedule_next_progression(order_id)
-            else:
-                logger.info(f"✅ Order {order_id} completed all progression states - DELIVERED")
+                else:
+                    logger.warning(f"✅ Order {order_id} reached DELIVERED status - auto-progression complete")
         
         except Exception as e:
             logger.error(f"Error in auto-progression for {order_id}: {e}", exc_info=True)
     
-    # Schedule the progression to happen after 30 seconds
+    # Schedule the progression with adaptive timing
+    # PROCESSING -> PACKED is fast (5 sec), others are 30 sec
+    fulfillment_data = redis_utils.get_fulfillment(order_id)
+    if fulfillment_data:
+        current_status_raw = fulfillment_data.get('current_status', 'PROCESSING')
+        if isinstance(current_status_raw, str) and 'FulfillmentStatus.' in current_status_raw:
+            current_status_raw = current_status_raw.split('.')[-1]
+        delay_seconds = 10 if current_status_raw == 'PROCESSING' else 30
+    else:
+        delay_seconds = 10 # Default to 10 for new orders
+    
     # Use datetime.now() instead of utcnow() to match scheduler's timezone
     job_id = f"progress_{order_id}_{uuid.uuid4()}"
     scheduler.add_job(
         progress_order,
         'date',
-        run_date=datetime.now() + timedelta(seconds=30),
+        run_date=datetime.now() + timedelta(seconds=delay_seconds),
         id=job_id,
         replace_existing=False
     )
+    logger.info(f"📅 Scheduled next progression for {order_id} in {delay_seconds} seconds")
     pass  # Job scheduled (silent)
 
 # ============================================================================
@@ -801,7 +817,7 @@ def start_fulfillment(request: StartFulfillmentRequest) -> FulfillmentRecord:
     # Store in Redis
     redis_utils.store_fulfillment(request.order_id, fulfillment.dict())
     
-    # Schedule auto-progression (30-second intervals)
+    # Schedule auto-progression (5-second initial delay, then 30-second intervals)
     _schedule_next_progression(request.order_id)
     
     pass  # Fulfillment started with auto-progression
@@ -943,14 +959,15 @@ def mark_delivered(request: MarkDeliveredRequest) -> FulfillmentRecord:
     redis_utils.store_fulfillment(request.order_id, fulfillment_dict)
 
     # Broadcast WebSocket event for DELIVERED
+    logger.warning(f"🔔 Broadcasting DELIVERED status for order {request.order_id}")
     try:
         loop = asyncio.new_event_loop()
         asyncio.set_event_loop(loop)
         loop.run_until_complete(manager.broadcast_delivery_update(request.order_id, fulfillment_dict))
         loop.close()
-        pass  # Broadcast sent (silent)
+        logger.warning(f"✅ Successfully broadcasted DELIVERED for order {request.order_id}")
     except Exception as e:
-        logger.error(f"Failed to broadcast WebSocket: {e}")
+        logger.error(f"❌ Failed to broadcast WebSocket for DELIVERED: {e}", exc_info=True)
     
     # Log event
     redis_utils.add_fulfillment_event(request.order_id, {

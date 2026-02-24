@@ -239,7 +239,10 @@ const Chat = () => {
       socket.onmessage = (event) => {
         try {
           const payload = JSON.parse(event.data);
+          console.log('🔔 WebSocket message received:', payload);
+          
           if (payload?.type !== 'delivery_update') {
+            console.log('⚠️ Ignoring non-delivery_update message');
             return;
           }
 
@@ -247,6 +250,8 @@ const Chat = () => {
           const fulfillment = payload.fulfillment || {};
           const rawStatus = fulfillment.current_status || 'UNKNOWN';
           const status = String(rawStatus).replace('FulfillmentStatus.', '').toUpperCase();
+
+          console.log(`📦 Delivery update for Order ${orderId}: ${status}`);
 
           const statusMessages = {
             PROCESSING: '📦 Your order is being carefully prepared with utmost care.\n\nOur team is picking and packing your items to ensure they arrive in perfect condition!',
@@ -272,6 +277,7 @@ const Chat = () => {
             responseText += `\n\n⭐ We'd love your feedback! Rate and review your purchase.`;
           }
 
+          console.log(`✅ Appending ${status} message to chat`);
           appendAgentMessage(responseText);
           setLastTrackedOrderId(orderId);
           setLastOrderStatus(status);
@@ -540,6 +546,9 @@ const Chat = () => {
             const hasHistory = restoreData.session.data?.chat_context?.length > 0;
             const hasCart = restoreData.session.data?.cart?.length > 0;
             
+            // Collect all messages to set at once (avoid losing messages to timing issues)
+            let allMessages = [];
+            
             if (hasHistory) {
               console.log('📚 Restoring chat history...');
               const chatMessages = restoreData.session.data.chat_context.map((msg, idx) => ({
@@ -551,32 +560,34 @@ const Chat = () => {
                 cards: msg.metadata?.cards || []
               }));
               
-              // Add AI-powered welcome summary as the LAST message for returning users
+              // Add chat history first
+              allMessages.push(...chatMessages);
+              
+              // Add AI-powered welcome summary AFTER chat history for returning users
               if (hasHistory || hasCart) {
-                console.log('📨 Fetching AI summary to append as last message...');
+                console.log('📨 Fetching AI summary to append after chat history...');
                 const summaryMessage = await fetchAndDisplayChatSummary(storedToken);
                 if (summaryMessage) {
-                  chatMessages.push({
+                  allMessages.push({
                     ...summaryMessage,
                     id: chatMessages.length + 1
                   });
-                  console.log('✅ Chat history restored + summary appended as last message');
+                  console.log('✅ Chat history + summary collected');
                 }
               }
-              
-              setMessages(chatMessages);
             } else {
               // New user - show welcome message
-              setMessages([{
+              allMessages.push({
                 id: 1,
                 text: `Welcome to WhatsApp Shopping! I'm your personal shopping assistant. How can I help you today?`,
                 sender: 'agent',
                 timestamp: new Date().toLocaleTimeString('en-US', { hour: '2-digit', minute: '2-digit' }),
                 status: 'delivered'
-              }]);
+              });
             }
             
             // Handle special navigation states (payment success, post-purchase, stylist)
+            // Collect these BEFORE setting messages so they're all included together
             const currentMessages = [];
             
             // Check for payment success message from navigation state
@@ -632,10 +643,9 @@ const Chat = () => {
               navigate(location.pathname, { replace: true, state: {} });
             }
             
-            // Append special state messages if any
-            if (currentMessages.length > 0) {
-              setMessages(prev => [...prev, ...currentMessages]);
-            }
+            // Add all collected messages at once to prevent timing issues
+            const finalMessages = [...allMessages, ...currentMessages];
+            setMessages(finalMessages);
             
             return;
           }

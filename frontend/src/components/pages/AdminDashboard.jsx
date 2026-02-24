@@ -360,6 +360,12 @@ const AdminDashboard = () => {
                         <div className="mt-6 pt-6 border-t border-gray-300">
                           <p className="text-xs text-gray-600 uppercase tracking-wider font-bold mb-3">Product Details</p>
                           <div className="grid grid-cols-2 md:grid-cols-4 gap-4">
+                            {res.product_name && (
+                              <div>
+                                <p className="text-xs text-gray-500">Product Name</p>
+                                <p className="font-semibold text-gray-900">{res.product_name}</p>
+                              </div>
+                            )}
                             <div>
                               <p className="text-xs text-gray-500">SKU</p>
                               <p className="font-semibold text-gray-900">{res.sku}</p>
@@ -380,6 +386,29 @@ const AdminDashboard = () => {
                               <p className="text-xs text-gray-500">Expires At</p>
                               <p className="text-sm text-gray-900">{formatDate(res.expires_at)} {formatTime(res.expires_at)}</p>
                             </div>
+                          </div>
+                        </div>
+
+                        {/* Customer Details */}
+                        <div className="mt-6 pt-6 border-t border-gray-300">
+                          <p className="text-xs text-gray-600 uppercase tracking-wider font-bold mb-3">Customer Details</p>
+                          <div className="grid grid-cols-2 md:grid-cols-3 gap-4">
+                            <div>
+                              <p className="text-xs text-gray-500">Customer ID</p>
+                              <p className="font-semibold text-gray-900">{res.customer_id}</p>
+                            </div>
+                            {res.customer_name && (
+                              <div>
+                                <p className="text-xs text-gray-500">Name</p>
+                                <p className="font-semibold text-gray-900">{res.customer_name}</p>
+                              </div>
+                            )}
+                            {res.customer_phone && (
+                              <div>
+                                <p className="text-xs text-gray-500">Phone</p>
+                                <p className="font-semibold text-gray-900">{res.customer_phone}</p>
+                              </div>
+                            )}
                           </div>
                         </div>
                       </div>
@@ -449,6 +478,12 @@ const AdminDashboard = () => {
                         <div className="bg-white rounded-xl shadow-md p-6 border-l-4 border-green-500">
                           <p className="text-xs text-gray-600 uppercase tracking-wider font-bold mb-4">Customer Profile</p>
                           <div className="space-y-2">
+                            {insights[res.reservation_id].customer.name && (
+                              <p className="text-sm text-gray-700"><span className="font-semibold text-gray-900">Name:</span> {insights[res.reservation_id].customer.name}</p>
+                            )}
+                            {insights[res.reservation_id].customer.phone && (
+                              <p className="text-sm text-gray-700"><span className="font-semibold text-gray-900">Phone:</span> {insights[res.reservation_id].customer.phone}</p>
+                            )}
                             <p className="text-sm text-gray-700"><span className="font-semibold text-gray-900">Loyalty Tier:</span> {insights[res.reservation_id].customer.loyalty_tier}</p>
                             <p className="text-sm text-gray-700"><span className="font-semibold text-gray-900">Interactions:</span> {insights[res.reservation_id].customer.previous_interactions} messages</p>
                             <p className="text-sm text-gray-700"><span className="font-semibold text-gray-900">Interests:</span> {insights[res.reservation_id].customer.interests.length > 0 ? insights[res.reservation_id].customer.interests.join(', ') : 'New customer'}</p>

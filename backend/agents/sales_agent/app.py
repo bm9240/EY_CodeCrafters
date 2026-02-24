@@ -296,7 +296,7 @@ async def get_chat_summary(session_token: str, mode: str = "whatsapp"):
                 logger.info(f"🏆 Fetching real loyalty data for customer {customer_id}...")
                 loyalty_resp = requests.get(
                     f"http://localhost:8002/loyalty/tier/{customer_id}",
-                    timeout=5
+                    timeout=15
                 )
                 if loyalty_resp.status_code == 200:
                     loyalty_data = loyalty_resp.json()
@@ -1095,7 +1095,7 @@ async def list_stores():
         # Call inventory service
         response = requests.get(
             "http://localhost:8001/stores",
-            timeout=5
+            timeout=15
         )
         response.raise_for_status()
         
@@ -1167,7 +1167,7 @@ async def check_store_inventory(store_location: str, sku: str):
         # Call inventory service
         response = requests.get(
             f"http://localhost:8001/stores/{store_location}/inventory/{sku}",
-            timeout=5
+            timeout=15
         )
         response.raise_for_status()
         
@@ -1373,7 +1373,7 @@ async def reserve_in_store(request: ReserveInStoreRequest):
                     "store_location": store_normalized,
                     "hold_id": f"reserve-{uuid.uuid4()}"
                 },
-                timeout=5
+                timeout=15
             )
             
             if reservation_response.status_code != 200:
@@ -1461,7 +1461,7 @@ async def release_hold(hold_id: str):
         response = requests.post(
             "http://localhost:8001/release",
             json={"hold_id": hold_id},
-            timeout=5
+            timeout=15
         ).json()
         
         logger.info(f"✅ Hold released: {hold_id}")
@@ -1507,7 +1507,7 @@ async def list_admin_reservations(store: str = None):
         url = f"http://localhost:8012/admin/reservations?store={store}"
         logger.debug(f"🔗 Calling Reservation Service: {url}")
         
-        response = requests.get(url, timeout=5)
+        response = requests.get(url, timeout=15)
         
         logger.debug(f"🔗 Reservation Service response status: {response.status_code}")
         if response.status_code != 200:
@@ -1549,7 +1549,7 @@ async def confirm_admin_reservation(reservation_id: str, store: str = None):
         # Call reservation service to confirm
         response = requests.put(
             f"http://localhost:8012/admin/reservations/{reservation_id}/confirm?store={store}",
-            timeout=5
+            timeout=15
         )
         response.raise_for_status()
         
@@ -1587,7 +1587,7 @@ async def convert_admin_reservation(reservation_id: str, store: str = None, orde
         if order_id:
             url += f"&order_id={order_id}"
         
-        response = requests.put(url, timeout=5)
+        response = requests.put(url, timeout=15)
         response.raise_for_status()
         
         result = response.json()
@@ -1630,7 +1630,7 @@ async def create_customer_reservation(request: ReservationCreateRequest):
         response = requests.post(
             "http://localhost:8012/reservations",
             json=request.dict(),
-            timeout=5
+            timeout=15
         )
         response.raise_for_status()
         
@@ -1663,7 +1663,7 @@ async def list_customer_reservations(customer_id: str = None):
         
         response = requests.get(
             f"http://localhost:8012/reservations?customer_id={customer_id}",
-            timeout=5
+            timeout=15
         )
         response.raise_for_status()
         
@@ -1693,7 +1693,7 @@ async def get_customer_reservation(reservation_id: str):
         
         response = requests.get(
             f"http://localhost:8012/reservations/{reservation_id}",
-            timeout=5
+            timeout=15
         )
         response.raise_for_status()
         
@@ -1731,7 +1731,7 @@ async def update_customer_reservation_status(reservation_id: str, request: Reser
         response = requests.put(
             f"http://localhost:8012/reservations/{reservation_id}/status",
             json=request.dict(),
-            timeout=5
+            timeout=15
         )
         response.raise_for_status()
         
@@ -1761,7 +1761,7 @@ async def cancel_customer_reservation(reservation_id: str):
         
         response = requests.delete(
             f"http://localhost:8012/reservations/{reservation_id}",
-            timeout=5
+            timeout=15
         )
         response.raise_for_status()
         

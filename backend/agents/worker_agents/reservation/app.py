@@ -96,6 +96,7 @@ class ReservationResponse(BaseModel):
     created_at: str
     confirmed_at: Optional[str] = None
     converted_at: Optional[str] = None
+    converted_at: Optional[str] = None
 
 
 class ReservationListResponse(BaseModel):
@@ -761,7 +762,7 @@ async def get_reservation_insights(reservation_id: str):
             logger.error(f"❌ ERROR fetching interest product names: {interest_err}", exc_info=True)
         
         # Fetch customer context from Supabase and Session data
-        customer_context = {"interests": [], "chat_summary": "", "loyalty_tier": "New Member", "interactions": 0, "chat_history": []}
+        customer_context = {"interests": [], "chat_summary": "", "loyalty_tier": "New Member", "interactions": 0, "chat_history": [], "name": None, "phone": None}
         try:
             # Get customer data from Supabase
             if supabase_client.FEATURE_SUPABASE_READ:
@@ -788,9 +789,11 @@ async def get_reservation_insights(reservation_id: str):
                         "loyalty_tier": cust.get("loyalty_tier", "New Member"),
                         "interactions": cust.get("items_purchased", 0),
                         "interests": interests_list,
-                        "chat_summary": f"Customer rated {cust.get('average_rating', 'N/A')}, {cust.get('satisfaction', 'unknown')} with service"
+                        "chat_summary": f"Customer rated {cust.get('average_rating', 'N/A')}, {cust.get('satisfaction', 'unknown')} with service",
+                        "name": cust.get("name") or cust.get("customer_name"),
+                        "phone": cust.get("phone_number") or cust.get("phone")
                     }
-                    logger.info(f"✓ Fetched customer context for {customer_id} from database")
+                    logger.info(f"✓ Fetched customer context for {customer_id} from database (Name: {customer_context.get('name')}, Phone: {customer_context.get('phone')})")
                 
                 # Fetch session/chat history for this customer
                 try:
@@ -963,6 +966,8 @@ Write the paragraph now."""
                 "description": product_info.get("description", "")[:200]
             },
             "customer": {
+                "name": customer_context.get("name"),
+                "phone": customer_context.get("phone"),
                 "loyalty_tier": customer_context.get("loyalty_tier", "New Member"),
                 "previous_interactions": customer_context.get("interactions", 0),
                 "interests": customer_context.get("interests", []),

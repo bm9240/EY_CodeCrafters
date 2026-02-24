@@ -230,13 +230,10 @@ const MyReservations = () => {
                       {res.product_image && (
                         <img
                           src={res.product_image}
-                          alt={res.product_name}
+                          alt={res.sku}
                           className="w-28 h-28 object-cover rounded-lg mb-3 shadow-sm"
                           onError={(e) => (e.target.style.display = 'none')}
                         />
-                      )}
-                      {res.product_name && (
-                        <p className="text-sm font-bold text-gray-900 mb-1">{res.product_name}</p>
                       )}
                       <p className="text-sm text-gray-700 mb-1"><span className="font-semibold">SKU:</span> {res.sku}</p>
                       <p className="text-sm text-gray-700"><span className="font-semibold">Qty:</span> {res.quantity}</p>
