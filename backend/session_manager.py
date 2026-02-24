@@ -215,6 +215,28 @@ def is_supabase_enabled():
         return False
 
 
+def normalize_phone(phone: Optional[str]) -> Optional[str]:
+    """Normalize phone number to digits-only format for consistent lookups."""
+    if not phone:
+        return None
+    # Remove all non-digit characters
+    normalized = "".join(ch for ch in str(phone) if ch.isdigit())
+    return normalized if normalized else None
+
+
+def normalize_channel(channel: str) -> str:
+    """Normalize channel value to match database constraint."""
+    channel_map = {
+        "web": "website",
+        "whatsapp": "whatsapp",
+        "telegram": "telegram",
+        "kiosk": "kiosk",
+        "website": "website"
+    }
+    normalized = channel_map.get(channel.lower(), "website")
+    return normalized
+
+
 def save_session_to_supabase(session_token: str, session: Dict[str, Any]) -> bool:
     """Persist session to Supabase table 'sessions' (MATCHING YOUR SCHEMA).
     
@@ -247,28 +269,33 @@ def save_session_to_supabase(session_token: str, session: Dict[str, Any]) -> boo
         customer_id = session.get("customer_id")
         phone = session.get("phone")
         
+        # Normalize phone for consistent lookups
+        phone_normalized = normalize_phone(phone)
+        
         # Validate required fields
-        if not customer_id or not phone:
+        if not customer_id or not phone_normalized:
             logger.error(f"[SUPABASE] ❌ SAVE FAILED: Missing required fields. customer_id={customer_id}, phone={phone}")
             return False
         
         # Keep customer_id as STRING (not int) - schema is TEXT
         customer_id_str = str(customer_id).strip()
-        phone_str = str(phone).strip()
         
-        if not customer_id_str or not phone_str:
-            logger.error(f"[SUPABASE] ❌ SAVE FAILED: Empty customer_id or phone after strip")
+        if not customer_id_str or not phone_normalized:
+            logger.error(f"[SUPABASE] ❌ SAVE FAILED: Empty customer_id or phone after normalization")
             return False
         
         # Calculate expiry (7 days from now)
         now = datetime.utcnow().isoformat() + "Z"
         expires_at = (datetime.utcnow() + timedelta(days=7)).isoformat() + "Z"
         
+        # Normalize channel to match database constraint
+        channel_normalized = normalize_channel(session.get("channel", "whatsapp"))
+        
         session_record = {
             "customer_id": customer_id_str,  # TEXT - must be string
-            "phone": phone_str,  # TEXT
+            "phone": phone_normalized,  # TEXT - normalized digits only
             "session_token": session_token,  # TEXT UNIQUE
-            "channel": str(session.get("channel", "whatsapp")),  # TEXT
+            "channel": channel_normalized,  # TEXT - normalized (website/whatsapp/telegram/kiosk)
             "status": "active",  # TEXT
             "created_at": session.get("created_at", now),  # TIMESTAMPTZ
             "last_activity": now,  # TIMESTAMPTZ
@@ -288,18 +315,20 @@ def save_session_to_supabase(session_token: str, session: Dict[str, Any]) -> boo
             "Content-Type": "application/json"
         }
         
-        # UPSERT: First check if active session exists for this phone
+        # UPSERT: Check if ANY session exists for this phone (including logged_out/inactive)
         check_params = {
-            "phone": f"eq.{phone_str}",
-            "status": "eq.active",
+            "phone": f"eq.{phone_normalized}",
+            "order": "last_activity.desc",
             "limit": "1"
         }
         check_response = requests.get(url, headers=headers, params=check_params, timeout=5)
         
         if check_response.status_code == 200 and check_response.json():
-            # UPDATE existing session
+            # UPDATE existing session (reactivate if needed)
             existing = check_response.json()[0]
             existing_id = existing.get("session_id")
+            
+            logger.info(f"[SUPABASE] Found existing session (status={existing.get('status')}), will UPDATE and reactivate")
             
             update_params = {"session_id": f"eq.{existing_id}"}
             update_headers = {**headers, "Prefer": "return=minimal"}
@@ -307,7 +336,7 @@ def save_session_to_supabase(session_token: str, session: Dict[str, Any]) -> boo
             update_response = requests.patch(url, json=session_record, headers=update_headers, params=update_params, timeout=5)
             
             if update_response.status_code in [200, 204]:
-                logger.info(f"[SUPABASE] ✅ Session UPDATED: customer_id={customer_id_str}, phone={phone_str}")
+                logger.info(f"[SUPABASE] ✅ Session UPDATED: customer_id={customer_id_str}, phone={phone_normalized}")
                 return True
             else:
                 logger.error(f"[SUPABASE] ❌ UPDATE FAILED: Status={update_response.status_code}, Body={update_response.text}")
@@ -318,7 +347,7 @@ def save_session_to_supabase(session_token: str, session: Dict[str, Any]) -> boo
             insert_response = requests.post(url, json=session_record, headers=insert_headers, timeout=5)
             
             if insert_response.status_code in [200, 201]:
-                logger.info(f"[SUPABASE] ✅ Session INSERTED: customer_id={customer_id_str}, phone={phone_str}")
+                logger.info(f"[SUPABASE] ✅ Session INSERTED: customer_id={customer_id_str}, phone={phone_normalized}")
                 return True
             else:
                 logger.error(f"[SUPABASE] ❌ INSERT FAILED: Status={insert_response.status_code}, Body={insert_response.text}")
@@ -330,9 +359,10 @@ def save_session_to_supabase(session_token: str, session: Dict[str, Any]) -> boo
 
 
 def restore_session_from_supabase(phone: Optional[str] = None) -> Optional[Dict[str, Any]]:
-    """Restore active session from Supabase by phone (MATCHING YOUR SCHEMA).
+    """Restore session from Supabase by phone (MATCHING YOUR SCHEMA).
     
-    Looks up the most recent active session and verifies expiry.
+    Looks up the most recent session (active OR logged_out) and verifies expiry.
+    Reactivates logged_out sessions on restore.
     Returns None if not found or expired.
     Also restores session_id into PHONE_SESSION_IDS for continuity.
     """
@@ -340,12 +370,18 @@ def restore_session_from_supabase(phone: Optional[str] = None) -> Optional[Dict[
         logger.debug("[SUPABASE] Persistence disabled or no phone - skipping restore")
         return None
     
+    # Normalize phone for consistent lookups
+    phone_normalized = normalize_phone(phone)
+    if not phone_normalized:
+        logger.debug(f"[SUPABASE] Invalid phone format: {phone}")
+        return None
+    
     try:
         import requests
         from db.supabase_client import SUPABASE_URL, SUPABASE_SERVICE_ROLE_KEY
         from datetime import datetime
         
-        # Query for active, non-expired sessions
+        # Query for sessions (active OR logged_out), ordered by most recent
         url = f"{SUPABASE_URL}/rest/v1/sessions"
         headers = {
             "apikey": SUPABASE_SERVICE_ROLE_KEY,
@@ -353,10 +389,9 @@ def restore_session_from_supabase(phone: Optional[str] = None) -> Optional[Dict[
             "Content-Type": "application/json"
         }
         
-        # Filter by phone and active status, order by last_activity DESC
+        # Filter by phone, order by last_activity DESC (get most recent session)
         params = {
-            "phone": f"eq.{phone}",
-            "status": "eq.active",
+            "phone": f"eq.{phone_normalized}",
             "order": "last_activity.desc",
             "limit": "1"
         }
@@ -374,7 +409,12 @@ def restore_session_from_supabase(phone: Optional[str] = None) -> Optional[Dict[
                     logger.info(f"[SUPABASE] Session expired: {session_record['session_id']}")
                     return None
             
-            logger.info(f"[SUPABASE] ✅ Session restored: {str(session_record['session_id'])[:12]}...")
+            # Log restoration (including if we're reactivating a logged_out session)
+            session_status = session_record.get("status")
+            if session_status == "logged_out":
+                logger.info(f"[SUPABASE] ✅ Reactivating logged_out session: {str(session_record['session_id'])[:12]}...")
+            else:
+                logger.info(f"[SUPABASE] ✅ Session restored (status={session_status}): {str(session_record['session_id'])[:12]}...")
             
             # Initialize default data structure if metadata is empty/incomplete
             metadata = session_record.get("metadata", {})
@@ -405,25 +445,26 @@ def restore_session_from_supabase(phone: Optional[str] = None) -> Optional[Dict[
             
             # CRITICAL: Restore session_id mapping for persistence across restarts
             restored_session_id = str(session_record["session_id"])
-            PHONE_SESSION_IDS[phone] = restored_session_id
-            logger.info(f"[SUPABASE] Restored session_id mapping: {phone} -> {restored_session_id[:12]}...")
+            PHONE_SESSION_IDS[phone_normalized] = restored_session_id
+            logger.info(f"[SUPABASE] Restored session_id mapping: {phone_normalized} -> {restored_session_id[:12]}...")
             
             # Convert to in-memory format (reconstruct full session object)
+            # Always set is_active=True when restoring (reactivates logged_out sessions)
             return {
                 "session_id": restored_session_id,
-                "phone": session_record["phone"],
+                "phone": phone_normalized,  # Store normalized phone
                 "channel": session_record["channel"],
                 "customer_id": session_record["customer_id"],
                 "session_token": session_record["session_token"],
                 "created_at": session_record["created_at"],
                 "updated_at": session_record["last_activity"],
-                "is_active": session_record["status"] == "active",
+                "is_active": True,  # Reactivate session on restore
                 "expires_at": session_record["expires_at"],
                 "data": merged_data,
                 "metadata": merged_data
             }
         else:
-            logger.info(f"[SUPABASE] No active session found for phone: {phone}")
+            logger.info(f"[SUPABASE] No session found for phone: {phone_normalized}")
             return None
         
     except Exception as e:
@@ -707,17 +748,20 @@ def create_session(
         logger.error("[CREATE_SESSION] VALIDATION FAILED: No phone or telegram_chat_id provided")
         raise ValueError("Either phone or telegram_chat_id must be provided")
 
+    # Normalize phone for consistent lookups
+    phone_normalized = normalize_phone(phone) if phone else None
+    
     # Determine the primary identifier for session lookup
-    primary_id = phone or telegram_chat_id
+    primary_id = phone_normalized or telegram_chat_id
     logger.info(f"[CREATE_SESSION] Starting for primary_id={primary_id}, channel={channel}, customer_id={customer_id}")
     
     # PHASE 3: Check for existing session in memory first, then Supabase
     existing_token = None
     existing_session = None
     
-    # 1. Check in-memory first
-    if phone and phone in PHONE_SESSIONS:
-        existing_token = PHONE_SESSIONS[phone]
+    # 1. Check in-memory first (using normalized phone)
+    if phone_normalized and phone_normalized in PHONE_SESSIONS:
+        existing_token = PHONE_SESSIONS[phone_normalized]
         if existing_token in SESSIONS:
             existing_session = SESSIONS[existing_token]
     elif telegram_chat_id and telegram_chat_id in TELEGRAM_SESSIONS:
@@ -726,9 +770,9 @@ def create_session(
             existing_session = SESSIONS[existing_token]
     
     # 2. If not in memory but phone provided, check Supabase for persistence
-    if not existing_session and phone and is_supabase_enabled():
+    if not existing_session and phone_normalized and is_supabase_enabled():
         try:
-            supabase_session = restore_session_from_supabase(phone=phone)
+            supabase_session = restore_session_from_supabase(phone=phone_normalized)
             if supabase_session:
                 # Verify it's still active and not expired
                 if supabase_session.get("is_active") and supabase_session.get("expires_at"):
@@ -784,8 +828,8 @@ def create_session(
                 existing_session["customer_id"] = str(profile_customer_id)
                 if not existing_session.get("user_id"):
                     existing_session["user_id"] = str(profile_customer_id)
-                if phone:
-                    _register_phone_mapping(phone, profile_customer_id)
+                if phone_normalized:
+                    _register_phone_mapping(phone_normalized, profile_customer_id)
                 logger.info(f"[CREATE_SESSION] Updated customer_profile: customer_id={profile_customer_id}")
         
         # Update customer_id if provided
@@ -798,9 +842,9 @@ def create_session(
         SESSIONS[existing_token] = existing_session
         
         # Ensure phone mappings are restored (in case of server restart)
-        if phone and phone not in PHONE_SESSIONS:
-            PHONE_SESSIONS[phone] = existing_token
-            logger.info(f"[CREATE_SESSION] Restored phone mapping: {phone} → token")
+        if phone_normalized and phone_normalized not in PHONE_SESSIONS:
+            PHONE_SESSIONS[phone_normalized] = existing_token
+            logger.info(f"[CREATE_SESSION] Restored phone mapping: {phone_normalized} → token")
         
         # CRITICAL: Save updated session back to Supabase (channel, expires_at, etc.)
         try:
@@ -818,9 +862,9 @@ def create_session(
     # For phone-based sessions, use persistent session_id per phone
     # For Telegram-only sessions, create a new session_id
     session_id = None
-    if phone:
-        session_id = PHONE_SESSION_IDS.get(phone) or str(uuid.uuid4())
-        PHONE_SESSION_IDS[phone] = session_id
+    if phone_normalized:
+        session_id = PHONE_SESSION_IDS.get(phone_normalized) or str(uuid.uuid4())
+        PHONE_SESSION_IDS[phone_normalized] = session_id
     else:
         session_id = str(uuid.uuid4())
 
@@ -833,31 +877,27 @@ def create_session(
             logger.info(f"[CREATE_SESSION] Extracted customer_id from profile: {customer_id}")
 
     # Map to customer_id from CSV (only if phone is provided and customer_id not provided)
-    if not customer_id and phone:
-        customer_id = PHONE_TO_CUSTOMER.get(phone)
-        if not customer_id:
-            digits_only = "".join(ch for ch in str(phone) if ch.isdigit())
-            if digits_only:
-                customer_id = PHONE_TO_CUSTOMER.get(digits_only)
+    if not customer_id and phone_normalized:
+        customer_id = PHONE_TO_CUSTOMER.get(phone_normalized)
 
         if customer_id:
-            logger.info(f"[CREATE_SESSION] ✅ Mapped phone {phone} to customer_id {customer_id} from CSV")
-            _register_phone_mapping(phone, customer_id)
+            logger.info(f"[CREATE_SESSION] ✅ Mapped phone {phone_normalized} to customer_id {customer_id} from CSV")
+            _register_phone_mapping(phone_normalized, customer_id)
         else:
-            logger.warning(f"[CREATE_SESSION] ⚠️ Phone {phone} not found in customers.csv; ensuring Supabase record")
+            logger.warning(f"[CREATE_SESSION] ⚠️ Phone {phone_normalized} not found in customers.csv; ensuring Supabase record")
             try:
-                ensured = ensure_customer_record(phone)
+                ensured = ensure_customer_record(phone_normalized)
             except Exception as exc:
-                logger.warning(f"[CREATE_SESSION] Failed to ensure Supabase customer for phone {phone}: {exc}")
+                logger.warning(f"[CREATE_SESSION] Failed to ensure Supabase customer for phone {phone_normalized}: {exc}")
                 ensured = None
 
             if ensured:
                 ensured_id = ensured.get("customer_id")
                 customer_id = str(ensured_id) if ensured_id is not None else None
                 if customer_id:
-                    ensured_phone = str(ensured.get("phone_number") or phone)
+                    ensured_phone = str(ensured.get("phone_number") or phone_normalized)
                     _register_phone_mapping(ensured_phone, customer_id)
-                    _register_phone_mapping(phone, customer_id)
+                    _register_phone_mapping(phone_normalized, customer_id)
                     logger.info(f"[CREATE_SESSION] ✅ Created Supabase customer {customer_id} for phone {ensured_phone}")
     
     # Build complete session payload with required structure
@@ -869,7 +909,7 @@ def create_session(
     
     session = {
         "session_id": session_id,  # persistent id for the phone (or unique for Telegram-only)
-        "phone": phone,  # primary identifier (can be None)
+        "phone": phone_normalized,  # primary identifier - normalized (can be None)
         "telegram_chat_id": telegram_chat_id,  # Telegram chat ID (can be None)
         "channel": channel,  # current channel
         "user_id": resolved_user_id,  # can be None
@@ -901,18 +941,18 @@ def create_session(
     # Store session in the global in-memory dict
     SESSIONS[token] = session
 
-    # Update mappings
-    if phone:
-        PHONE_SESSIONS[phone] = token
+    # Update mappings (use normalized phone for consistency)
+    if phone_normalized:
+        PHONE_SESSIONS[phone_normalized] = token
         if customer_id:
-            _register_phone_mapping(phone, customer_id)
+            _register_phone_mapping(phone_normalized, customer_id)
     if telegram_chat_id:
         TELEGRAM_SESSIONS[telegram_chat_id] = token
-        if phone:
-            TELEGRAM_TO_PHONE[telegram_chat_id] = phone
+        if phone_normalized:
+            TELEGRAM_TO_PHONE[telegram_chat_id] = phone_normalized
 
     # Log for visibility - CRITICAL for debugging
-    logger.info(f"[CREATE_SESSION] ✅ SUCCESS (Memory): token={token[:20]}..., session_id={session_id}, phone={phone}, customer_id={customer_id}, channel={channel}, expires_at={expires_at}")
+    logger.info(f"[CREATE_SESSION] ✅ SUCCESS (Memory): token={token[:20]}..., session_id={session_id}, phone={phone_normalized}, customer_id={customer_id}, channel={channel}, expires_at={expires_at}")
 
     # PHASE 3: Persist to Supabase (async, non-blocking)
     try:
@@ -1218,9 +1258,17 @@ async def session_start(request: dict = Body(...)):
     logger.info(f"[SESSION_START] Received raw request: {request}")
     
     try:
-        # Extract fields from request dict
+        # Extract fields from request dict and ensure phone is a string
         phone = request.get('phone')
+        if phone is not None:
+            phone = str(phone).strip()  # Convert to string and strip whitespace
+            if not phone:  # Empty after stripping
+                phone = None
+        
         telegram_chat_id = request.get('telegram_chat_id')
+        if telegram_chat_id is not None:
+            telegram_chat_id = str(telegram_chat_id).strip()
+        
         channel = request.get('channel', 'whatsapp')
         user_id = request.get('user_id')
         customer_id = request.get('customer_id')
@@ -1234,10 +1282,16 @@ async def session_start(request: dict = Body(...)):
         
         # If no customer_id provided, try to resolve it
         if not customer_id and phone:
-            # First check CSV mapping
+            # Normalize phone for consistent lookups
+            phone_normalized_lookup = normalize_phone(phone)
+            
+            # First check CSV mapping (try both original and normalized)
             if phone in PHONE_TO_CUSTOMER:
                 customer_id = PHONE_TO_CUSTOMER[phone]
-                logger.info(f"[SESSION_START] Resolved customer_id from CSV mapping: {customer_id}")
+                logger.info(f"[SESSION_START] Resolved customer_id from CSV mapping (original): {customer_id}")
+            elif phone_normalized_lookup and phone_normalized_lookup in PHONE_TO_CUSTOMER:
+                customer_id = PHONE_TO_CUSTOMER[phone_normalized_lookup]
+                logger.info(f"[SESSION_START] Resolved customer_id from CSV mapping (normalized): {customer_id}")
             else:
                 # Try to load from CSV
                 import pandas as pd
@@ -1247,6 +1301,8 @@ async def session_start(request: dict = Body(...)):
                     if len(matches) > 0:
                         customer_id = str(matches.iloc[0]['customer_id'])
                         _register_phone_mapping(phone, customer_id)
+                        if phone_normalized_lookup:
+                            _register_phone_mapping(phone_normalized_lookup, customer_id)
                         logger.info(f"[SESSION_START] Loaded customer_id from CSV: {customer_id}")
                 except Exception as csv_err:
                     logger.debug(f"[SESSION_START] CSV lookup failed: {csv_err}")
@@ -1304,7 +1360,10 @@ async def session_restore(
 
     PHASE 2: First checks in-memory, then falls back to Supabase for persistent recovery with sliding 7-day expiry.
     """
-    logger.info(f"[SESSION_RESTORE] Received: token={x_session_token[:20] if x_session_token else None}..., phone={x_phone}")
+    # Normalize phone if provided
+    x_phone_normalized = normalize_phone(x_phone) if x_phone else None
+    
+    logger.info(f"[SESSION_RESTORE] Received: token={x_session_token[:20] if x_session_token else None}..., phone={x_phone_normalized}")
     
     # Try to restore by session token first (in-memory)
     if x_session_token:
@@ -1319,9 +1378,9 @@ async def session_restore(
         except HTTPException:
             # Not in memory - try Supabase as failover
             logger.debug(f"[SESSION_RESTORE] Token not in memory, checking Supabase...")
-            if x_phone:
+            if x_phone_normalized:
                 try:
-                    supabase_session = restore_session_from_supabase(phone=x_phone)
+                    supabase_session = restore_session_from_supabase(phone=x_phone_normalized)
                     if supabase_session and supabase_session.get("session_token") == x_session_token:
                         # Reload into memory
                         SESSIONS[x_session_token] = supabase_session
@@ -1333,10 +1392,10 @@ async def session_restore(
             raise HTTPException(status_code=404, detail="Session not found")
 
     # Try to restore by phone (omni-channel recovery)
-    if x_phone:
-        # Check memory first
-        if x_phone in PHONE_SESSIONS:
-            token = PHONE_SESSIONS[x_phone]
+    if x_phone_normalized:
+        # Check memory first (use normalized phone)
+        if x_phone_normalized in PHONE_SESSIONS:
+            token = PHONE_SESSIONS[x_phone_normalized]
             try:
                 session = get_session(token)
                 session_id = session.get("session_id")
@@ -1349,17 +1408,17 @@ async def session_restore(
         
         # Try Supabase as fallback
         try:
-            supabase_session = restore_session_from_supabase(phone=x_phone)
+            supabase_session = restore_session_from_supabase(phone=x_phone_normalized)
             if supabase_session:
                 token = supabase_session.get("session_token")
-                PHONE_SESSIONS[x_phone] = token
+                PHONE_SESSIONS[x_phone_normalized] = token
                 SESSIONS[token] = supabase_session
                 logger.info(f"[SESSION_RESTORE] ✅ Recovered from Supabase by phone")
                 return JSONResponse(status_code=200, content={"session_token": token, "session": supabase_session})
         except Exception as e:
             logger.debug(f"[SESSION_RESTORE] Supabase phone lookup failed: {e}")
         
-        logger.warning(f"[SESSION_RESTORE] ⚠️ No session for phone: {x_phone}")
+        logger.warning(f"[SESSION_RESTORE] ⚠️ No session for phone: {x_phone_normalized}")
         raise HTTPException(status_code=404, detail="Session not found for this phone number")
 
     # No valid identifier provided
