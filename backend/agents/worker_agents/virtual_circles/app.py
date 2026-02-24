@@ -1573,7 +1573,7 @@ def get_ai_recommendation(circle_id: str, user_id: str):
 
 1. **Top Pick**: Recommend a product that matches the circle's brand/category preferences {'from the list above' if peer_products else 'based on the circle profile'}
 2. **Why It's Perfect**: Explain why it matches the circle's style (2-3 reasons)
-3. **Peer Proof**: {'Mention how many peers love it' if peer_products else 'Explain why it fits the circle\'s style preferences'}
+3. **Peer Proof**: {'Mention how many peers love it' if peer_products else "Explain why it fits the circle's style preferences"}
 4. **Style Tip**: Give a styling or usage suggestion
 5. **Alternatives**: Briefly mention 1-2 other options that would also fit
 

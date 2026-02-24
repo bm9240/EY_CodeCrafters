@@ -1,3 +1,6 @@
+# --- Supabase Client ---
+supabase
+
 # --- Agent Frameworks ---
 langgraph
 

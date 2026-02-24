@@ -16,12 +16,19 @@ from dotenv import load_dotenv
 # Load .env from backend folder (search upward from this file)
 _this_dir = Path(__file__).resolve().parent
 _backend_env = _this_dir.parent / ".env"
+print(f"[supabase_client] Looking for .env at: {_backend_env}")
 if _backend_env.exists():
     load_dotenv(_backend_env)
     print(f"[supabase_client] Loaded .env from: {_backend_env}")
 else:
-    load_dotenv()  # fallback to default search
-    print("[supabase_client] Using default dotenv search")
+    # Try searching from current working directory
+    cwd_env = Path.cwd() / ".env"
+    if cwd_env.exists():
+        load_dotenv(cwd_env)
+        print(f"[supabase_client] Loaded .env from cwd: {cwd_env}")
+    else:
+        load_dotenv()  # fallback to default search
+        print("[supabase_client] Using default dotenv search")
 
 logger = logging.getLogger(__name__)
 
@@ -40,6 +47,19 @@ logger.info(
     FEATURE_SUPABASE_READ,
     FEATURE_SUPABASE_WRITE,
 )
+
+# Add supabase client after environment variables are loaded
+try:
+    from supabase import create_client, Client
+    if SUPABASE_URL and SUPABASE_ANON_KEY:
+        supabase: Client = create_client(SUPABASE_URL, SUPABASE_ANON_KEY)
+        print("[supabase_client] Supabase client initialized")
+    else:
+        supabase = None
+        print("[supabase_client] Supabase credentials not found")
+except ImportError:
+    supabase = None
+    print("[supabase_client] Supabase client not available (install supabase-py)")
 
 
 def _get_read_key() -> str:
@@ -254,3 +274,16 @@ def update(
     except requests.exceptions.RequestException as exc:
         logger.warning("[supabase_client] Update request error for %s: %s", table, exc)
         raise
+
+
+# Export the supabase client instance
+__all__ = [
+    "supabase",
+    "is_enabled",
+    "is_write_enabled",
+    "select",
+    "select_one",
+    "insert",
+    "update",
+    "upsert",
+]

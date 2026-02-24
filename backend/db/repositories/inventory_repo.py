@@ -4,7 +4,7 @@ Inventory repository: reads stock from Supabase.
 Expects an 'inventory' table with columns: sku, store_id, quantity
 """
 from typing import Dict, Any, Optional
-from ..supabase_client import select, is_enabled
+from ..supabase_client import supabase, is_enabled
 
 
 def _aggregate_rows(rows) -> Dict[str, Any]:
@@ -43,22 +43,34 @@ def get_stock(sku: str) -> Optional[Dict[str, Any]]:
         {"online": int, "stores": {store_id: qty}, "total": int}
         or None on error/empty
     """
-    if not is_enabled():
+    if not is_enabled() or supabase is None:
+        print("[inventory_repo] Supabase not enabled or client not available")
         return None
     
-    # Normalize SKU: trim and uppercase (matches how SKUs are stored)
-    sku_normalized = sku.strip().upper()
+    # Normalize SKU before querying
+    normalized_sku = str(sku).strip().upper()
+    
+    # Log what we are querying
+    print(f"[inventory_repo] Querying Supabase for SKU={normalized_sku}")
+    
     try:
-        # Query Supabase for normalized SKU
-        rows = select("inventory", params=f"sku=eq.'{sku_normalized}'", columns="sku,store_id,quantity")
-        if not rows:
-            print(f"[inventory_repo] No rows for SKU={sku_normalized}")
+        # Use correct Supabase query syntax
+        response = supabase.table("inventory").select("*").eq("sku", normalized_sku).execute()
+        
+        # Log raw response
+        print("Supabase raw response:", response)
+        
+        # Fix response checking
+        if response.data and len(response.data) > 0:
+            result = _aggregate_rows(response.data)
+            print(f"[inventory_repo] Supabase returned {len(response.data)} rows for SKU={normalized_sku}, result={result}")
+            return result
+        else:
+            print(f"[inventory_repo] No data in response for SKU={normalized_sku}")
             return None
-        result = _aggregate_rows(rows)
-        print(f"[inventory_repo] Supabase returned {len(rows)} rows for SKU={sku_normalized}, stores={result['stores']}")
-        return result
+            
     except Exception as e:
-        print(f"[inventory_repo] Error querying SKU={sku_normalized}: {e}")
+        print(f"[inventory_repo] Error querying SKU={normalized_sku}: {e}")
         return None
 
 
