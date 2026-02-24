@@ -1,4 +1,4 @@
-import { useState } from 'react';
+import { useState, useEffect } from 'react';
 import { useNavigate } from 'react-router-dom';
 import { useCart } from '@/contexts/CartContext';
 import { ArrowLeft, CheckCircle, AlertCircle, Loader, Minus, Plus, Trash2 } from 'lucide-react';
@@ -13,6 +13,41 @@ const CheckoutPage = () => {
   const [isProcessing, setIsProcessing] = useState(false);
   const [paymentStatus, setPaymentStatus] = useState(null); // 'success' | 'error' | null
   const [statusMessage, setStatusMessage] = useState('');
+  const [loyaltyData, setLoyaltyData] = useState(null);
+
+  useEffect(() => {
+    const fetchLoyaltyDiscount = async () => {
+      const userId = String(sessionStore.getCustomerId());
+      const cartTotal = parseFloat(getCartTotal());
+      console.log("Fetching loyalty with userId:", userId, "cartTotal:", cartTotal);
+      if (!userId || userId === 'null' || userId === 'undefined' || cartTotal <= 0) {
+        console.log("Skipping loyalty fetch: invalid userId or cartTotal");
+        setLoyaltyData(null);
+        return;
+      }
+      try {
+        const response = await fetch('http://localhost:8002/loyalty/calculate-discounts', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ user_id: userId, cart_total: cartTotal })
+        });
+        if (!response.ok) {
+          console.error("Loyalty API error:", response.status, response.statusText);
+          const errorData = await response.json();
+          console.error("Error details:", errorData);
+          setLoyaltyData(null);
+          return;
+        }
+        const data = await response.json();
+        console.log("Loyalty response:", data);
+        setLoyaltyData(data);
+      } catch (error) {
+        console.error('Failed to fetch loyalty discount:', error);
+        setLoyaltyData(null);
+      }
+    };
+    fetchLoyaltyDiscount();
+  }, [cartItems, getCartTotal]);
 
   const formatINR = (amount) => {
     return amount.toLocaleString('en-IN', {
@@ -45,7 +80,7 @@ const CheckoutPage = () => {
 
     try {
       // Calculate total amount
-      const totalAmount = Number(getCartTotal());
+      const totalAmount = Number(loyaltyData?.final_total || getCartTotal());
       if (!Number.isFinite(totalAmount) || totalAmount <= 0) {
         throw new Error('Invalid cart total. Please review your cart items.');
       }
@@ -287,12 +322,18 @@ const CheckoutPage = () => {
               <div className="space-y-3 mb-6">
                 <div className="flex justify-between text-gray-700">
                   <span>Subtotal ({getCartCount()} items)</span>
-                  <span className="font-semibold">{formatINR(getCartTotal())}</span>
+                  <span className="font-semibold">{formatINR(loyaltyData?.original_total || getCartTotal())}</span>
                 </div>
+                {loyaltyData && loyaltyData.total_discount_amount > 0 && (
+                  <div className="flex justify-between text-gray-700">
+                    <span>Loyalty Discount</span>
+                    <span className="font-semibold text-green-600">-{formatINR(loyaltyData.total_discount_amount)}</span>
+                  </div>
+                )}
                 <div className="border-t border-gray-200 pt-3">
                   <div className="flex justify-between text-lg font-bold text-gray-900">
                     <span>Total Amount</span>
-                    <span className="text-green-600">{formatINR(getCartTotal())}</span>
+                    <span className="text-green-600">{formatINR(loyaltyData?.final_total || getCartTotal())}</span>
                   </div>
                 </div>
               </div>

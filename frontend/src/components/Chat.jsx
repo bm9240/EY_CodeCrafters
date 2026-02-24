@@ -1629,16 +1629,32 @@ const Chat = () => {
       const finalPrice = discountData.final_total;
       const savings = originalPrice - finalPrice;
 
-      const discountMessage = `🛒 **Purchase Summary**\n\n` +
+      // Calculate upgrade motivation
+      let upgradeMessage = '';
+
+      if (discountData.points_to_next_tier > 0 && discountData.next_tier) {
+        const approxSpendNeeded = discountData.points_to_next_tier * 100; // 1 point = ₹100 rule
+        
+        upgradeMessage =
+          `\n🚀 Almost There!\n` +
+          `You're just ${discountData.points_to_next_tier} points away from ${discountData.next_tier.toUpperCase()} tier!\n` +
+          `Spend approx ₹${approxSpendNeeded.toLocaleString()} more to unlock higher discounts & exclusive rewards.\n`;
+      } else {
+        upgradeMessage =
+          `\n👑 You're already enjoying the highest tier benefits!\n`;
+      }
+
+      const discountMessage =
+        `🛒 **Purchase Summary**\n\n` +
         `📦 Product: ${product.name}\n` +
         `💰 Original Price: ₹${originalPrice}\n` +
-        `${discountData.message}\n` +
         `💸 You Save: ₹${savings.toFixed(2)}\n` +
         `✅ Final Price: ₹${finalPrice.toFixed(2)}\n\n` +
-        `🎁 Your Loyalty Status:\n` +
+        `🎁 Your Loyalty Status\n` +
         `🏅 Tier: ${loyaltyTier}\n` +
-        `💎 Points: ${loyaltyPoints}\n\n` +
-        `Ready to proceed with payment?`;
+        `💎 Points: ${loyaltyPoints}\n` +
+        upgradeMessage +
+        `\nReady to proceed with payment?`;
 
       // Add discount summary message
       const discountMsg = {

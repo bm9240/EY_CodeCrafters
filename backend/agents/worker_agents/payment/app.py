@@ -1097,6 +1097,32 @@ async def create_razorpay_order(payload: RazorpayCreateOrderRequest):
     client = _ensure_razorpay_client()
 
     amount_rupees = Decimal(str(payload.amount_rupees))
+    customer_id = payload.notes.get("customer_id") if payload.notes else None
+    if customer_id:
+                    try:
+                        loyalty_response = requests.post(
+                            f"{LOYALTY_SERVICE_URL}/loyalty/calculate-discounts",
+                            json={
+                                "user_id": customer_id,
+                                "cart_total": float(amount_rupees)
+                            },
+                            timeout=5
+                        )
+
+                        loyalty_response.raise_for_status()
+                        loyalty_data = loyalty_response.json()
+
+                        # Replace amount with discounted total
+                        discounted_total = Decimal(str(loyalty_data["final_total"]))
+                        amount_rupees = discounted_total.quantize(Decimal("0.01"), rounding=ROUND_HALF_UP)
+
+                        # Store discount in notes so verify-payment can record it
+                        payload.notes["discount_applied"] = loyalty_data["total_discount_amount"]
+
+                        print("✅ Loyalty applied:", loyalty_data)
+
+                    except Exception as e:
+                        logger.warning(f"⚠️ Loyalty service failed: {e}")
     if amount_rupees <= 0:
         raise HTTPException(status_code=400, detail="amount_rupees must be greater than zero")
 
