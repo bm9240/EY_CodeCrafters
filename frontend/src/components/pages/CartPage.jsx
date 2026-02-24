@@ -441,10 +441,10 @@ const CartPage = () => {
                       </button>
                     </div>
 
-                    <div className="mt-4 space-y-2">
+                    <div className="mt-4 space-y-3">
                       {/* Store selector for reservation */}
-                      <div className="flex items-center gap-2">
-                        <label className="text-sm font-medium text-gray-700 min-w-fit">Select Store:</label>
+                      <div className="flex items-center gap-3">
+                        <label className="text-sm font-semibold text-gray-800 min-w-fit">Store:</label>
                         <select
                           value={selectedStore[item.sku] || ''}
                           onChange={(e) => {
@@ -452,7 +452,7 @@ const CartPage = () => {
                             setSelectedStore((prev) => ({ ...prev, [item.sku]: e.target.value }));
                           }}
                           disabled={storesLoading || stores.length === 0}
-                          className="flex-1 border border-gray-300 px-3 py-2 rounded-md text-sm bg-white hover:border-gray-400 disabled:bg-gray-100 disabled:cursor-not-allowed"
+                          className="flex-1 border-2 border-gray-300 px-3 py-2 rounded-lg text-sm bg-white hover:border-orange-400 focus:border-orange-500 focus:outline-none disabled:bg-gray-100 disabled:cursor-not-allowed font-medium"
                         >
                           <option value="">
                             {storesLoading ? 'Loading stores...' : stores.length === 0 ? 'No stores available' : 'Select a store'}
@@ -473,11 +473,11 @@ const CartPage = () => {
                       <button
                         onClick={() => handleReserveInStore(item)}
                         disabled={reserveLoading[item.id] || isReservationFresh(item)}
-                        className={`px-4 py-2 rounded-lg font-semibold transition-colors ${
-                          isReservationFresh(item) ? 'bg-green-100 text-green-700 cursor-default' : 'bg-blue-600 text-white hover:bg-blue-700'
+                        className={`w-full px-4 py-2 rounded-lg font-semibold transition-colors ${
+                          isReservationFresh(item) ? 'bg-gradient-to-r from-red-100 to-orange-100 text-red-700 cursor-default font-bold border-2 border-red-400' : 'bg-gradient-to-r from-red-600 to-orange-600 text-white hover:from-red-700 hover:to-orange-700'
                         } ${reserveLoading[item.id] ? 'opacity-70 cursor-wait' : ''}`}
                       >
-                        {isReservationFresh(item) ? 'Reserved in Store' : reserveLoading[item.id] ? 'Reserving...' : 'Reserve in Store'}
+                        {isReservationFresh(item) ? '✓ Reserved in Store' : reserveLoading[item.id] ? 'Reserving...' : 'Reserve in Store'}
                       </button>
 
                       {reserveFeedback[item.id] && <p className="text-sm text-gray-600">{reserveFeedback[item.id]}</p>}

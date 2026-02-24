@@ -1,6 +1,6 @@
 import { useEffect, useState } from 'react';
 import { useNavigate } from 'react-router-dom';
-import { User, Phone, MapPin, Award, TrendingUp, Calendar } from 'lucide-react';
+import { User, Phone, MapPin, Award, TrendingUp, Calendar, Package } from 'lucide-react';
 import Navbar from '@/components/Navbar.jsx';
 import QRAuth from '@/components/QRAuth.jsx';
 import sessionStore from '@/lib/session';
@@ -251,6 +251,14 @@ const ProfilePage = () => {
                 className="mt-4 w-full bg-white text-red-600 py-2 rounded-lg font-semibold hover:bg-orange-50 transition"
               >
                 View Orders
+              </button>
+
+              <button
+                onClick={() => navigate('/reservations')}
+                className="mt-2 w-full bg-white/20 text-white py-2 rounded-lg font-semibold hover:bg-white/30 transition flex items-center justify-center gap-2 border border-white/20"
+              >
+                <Package className="w-4 h-4" />
+                My Reservations
               </button>
             </div>
 

@@ -1109,6 +1109,45 @@ async def list_stores():
         raise HTTPException(status_code=500, detail=f"Failed to fetch stores: {str(e)}")
 
 
+@app.get("/api/products/{sku}")
+async def get_product_details(sku: str):
+    """
+    Get product details by SKU.
+    Used by Reservation Service to fetch product name and description.
+    
+    Args:
+        sku: Product SKU
+        
+    Returns:
+        Product details including name, description, price, category, image_url
+    """
+    try:
+        from db.repositories.products_repo import get_product_by_sku
+        
+        logger.info(f"📦 Fetching product details for SKU={sku}")
+        product = get_product_by_sku(sku)
+        
+        if product:
+            logger.info(f"✅ Found product: {product.get('name', 'Unknown')}")
+            return {
+                "sku": sku,
+                "name": product.get("name", f"Product {sku}"),
+                "description": product.get("description", ""),
+                "price": product.get("price", "N/A"),
+                "category": product.get("category", ""),
+                "image_url": product.get("image_url", product.get("image", ""))
+            }
+        else:
+            logger.warning(f"Product not found for SKU={sku}")
+            raise HTTPException(status_code=404, detail=f"Product not found for SKU {sku}")
+            
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"❌ Failed to fetch product details: {e}")
+        raise HTTPException(status_code=500, detail=f"Failed to fetch product: {str(e)}")
+
+
 @app.get("/api/stores/{store_location}/inventory/{sku}")
 async def check_store_inventory(store_location: str, sku: str):
     """
@@ -1734,6 +1773,51 @@ async def cancel_customer_reservation(reservation_id: str):
     except Exception as e:
         logger.error(f"❌ Failed to cancel reservation: {e}")
         raise HTTPException(status_code=500, detail=f"Failed to cancel reservation: {str(e)}")
+
+
+# ============================================================================
+
+@app.get("/api/reservations/{reservation_id}/insights")
+async def get_reservation_insights(reservation_id: str):
+    """
+    Get comprehensive customer insights for a reservation.
+    Orchestrates calls to the Reservation Service to fetch insights.
+    
+    Args:
+        reservation_id: Reservation ID to get insights for
+        
+    Returns:
+        Reservation insights with product details, customer profile, and AI-generated summary
+    """
+    try:
+        logger.info(f"📊 Fetching insights for reservation {reservation_id} via Sales Agent")
+        
+        # Call Reservation Service insights endpoint with extended timeout
+        response = requests.get(
+            f"http://localhost:8012/admin/reservations/{reservation_id}/insights",
+            timeout=30
+        )
+        
+        if response.status_code == 200:
+            insights = response.json()
+            logger.info(f"✅ Retrieved insights for {reservation_id}")
+            return insights
+        else:
+            logger.warning(f"Reservation Service returned {response.status_code}")
+            raise HTTPException(
+                status_code=response.status_code,
+                detail=f"Failed to fetch insights: {response.text[:200]}"
+            )
+            
+    except requests.exceptions.Timeout:
+        logger.error("Timeout calling Reservation Service")
+        raise HTTPException(status_code=504, detail="Reservation Service timeout")
+    except requests.exceptions.ConnectionError:
+        logger.error("Connection error to Reservation Service")
+        raise HTTPException(status_code=503, detail="Reservation Service unavailable")
+    except Exception as e:
+        logger.error(f"Error fetching insights: {e}")
+        raise HTTPException(status_code=500, detail=f"Failed to fetch insights: {str(e)}")
 
 
 # ============================================================================
