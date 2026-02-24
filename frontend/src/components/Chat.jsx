@@ -207,11 +207,12 @@ const Chat = () => {
     }
   }, []);
 
-  // Track if payment message was already handled
+  // Track if payment/post-purchase/stylist messages were already handled
   const paymentMessageHandledRef = useRef(false);
-  // Track if post-purchase/stylist requests were already handled
   const postPurchaseHandledRef = useRef(false);
   const stylistHandledRef = useRef(false);
+  // Persist navigation state messages so they are always merged after backend updates
+  const navMessagesRef = useRef([]);
 
   // Payment success message is now handled directly in startOrRestoreSession()
   // to ensure it's added AFTER session messages are restored
@@ -545,12 +546,8 @@ const Chat = () => {
             // Restore chat history for returning users
             const hasHistory = restoreData.session.data?.chat_context?.length > 0;
             const hasCart = restoreData.session.data?.cart?.length > 0;
-            
-            // Collect all messages to set at once (avoid losing messages to timing issues)
             let allMessages = [];
-            
             if (hasHistory) {
-              console.log('📚 Restoring chat history...');
               const chatMessages = restoreData.session.data.chat_context.map((msg, idx) => ({
                 id: idx + 1,
                 text: msg.message,
@@ -559,24 +556,17 @@ const Chat = () => {
                 status: 'read',
                 cards: msg.metadata?.cards || []
               }));
-              
-              // Add chat history first
               allMessages.push(...chatMessages);
-              
-              // Add AI-powered welcome summary AFTER chat history for returning users
               if (hasHistory || hasCart) {
-                console.log('📨 Fetching AI summary to append after chat history...');
                 const summaryMessage = await fetchAndDisplayChatSummary(storedToken);
                 if (summaryMessage) {
                   allMessages.push({
                     ...summaryMessage,
                     id: chatMessages.length + 1
                   });
-                  console.log('✅ Chat history + summary collected');
                 }
               }
             } else {
-              // New user - show welcome message
               allMessages.push({
                 id: 1,
                 text: `Welcome to WhatsApp Shopping! I'm your personal shopping assistant. How can I help you today?`,
@@ -585,15 +575,11 @@ const Chat = () => {
                 status: 'delivered'
               });
             }
-            
-            // Handle special navigation states (payment success, post-purchase, stylist)
-            // Collect these BEFORE setting messages so they're all included together
-            const currentMessages = [];
-            
-            // Check for payment success message from navigation state
+
+            // Always merge navMessagesRef.current after backend updates
             if (location.state?.paymentSuccess && location.state?.message && !paymentMessageHandledRef.current) {
               paymentMessageHandledRef.current = true;
-              currentMessages.push({
+              navMessagesRef.current.push({
                 id: Date.now(),
                 text: location.state.message,
                 sender: 'agent',
@@ -603,11 +589,9 @@ const Chat = () => {
               });
               navigate(location.pathname, { replace: true, state: {} });
             }
-            
-            // Check for post-purchase request
             if (location.state?.postPurchaseRequest && !postPurchaseHandledRef.current) {
               postPurchaseHandledRef.current = true;
-              currentMessages.push({
+              navMessagesRef.current.push({
                 id: Date.now() + 1,
                 text: `📦 Post-Purchase Support for Order ${location.state.orderId}\n\nHow can I help you today? Please select an option:`,
                 sender: 'agent',
@@ -622,11 +606,9 @@ const Chat = () => {
               });
               navigate(location.pathname, { replace: true, state: {} });
             }
-            
-            // Check for stylist request
             if (location.state?.stylistRequest && !stylistHandledRef.current) {
               stylistHandledRef.current = true;
-              currentMessages.push({
+              navMessagesRef.current.push({
                 id: Date.now() + 2,
                 text: `👗 Fetching personalized styling suggestions for your order...`,
                 sender: 'agent',
@@ -642,11 +624,7 @@ const Chat = () => {
               });
               navigate(location.pathname, { replace: true, state: {} });
             }
-            
-            // Add all collected messages at once to prevent timing issues
-            const finalMessages = [...allMessages, ...currentMessages];
-            setMessages(finalMessages);
-            
+            setMessages([...allMessages, ...navMessagesRef.current]);
             return;
           }
         } catch (err) {
